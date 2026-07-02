@@ -16598,6 +16598,17 @@ function renderProspectBody(mount){
   }
 }
 
+const STAGE_COLORS = {
+  new:     "#64748b",   // slate — not yet worked
+  engaging:"#0891b2",   // cyan — cadence running / outreach
+  engaged: "#00818B",   // Partners teal — actively working the checklist
+  deep:    "#2563eb",   // blue — deeper dive
+  loi:     "#f59e0b",   // gold/amber — offer out
+  closed:  "#16a34a",   // green — won
+  nurture: "#8b5cf6"    // violet — long-term
+};
+function stageColor(id){ return STAGE_COLORS[id] || "var(--brand-2)"; }
+
 function renderKanban(arr){
   const wrap = e("div",{class:"kanban-wrap"});
   const isTouch = ("ontouchstart" in window) || (navigator.maxTouchPoints > 0);
@@ -16605,7 +16616,7 @@ function renderKanban(arr){
     const stage = stageObj.id;
     const items = arr.filter(p => p.stage === stage);
     const col = e("div",{class:"kanban-col",data:{stage}});
-    col.style.setProperty("--stage", "var(--brand-2)");
+    col.style.setProperty("--stage", stageColor(stage));
     col.setAttribute("data-stage", stage);
     col.appendChild(e("div",{class:"kanban-col-head"},
       e("div",{class:"kc-name"}, stageObj.label),
@@ -16722,16 +16733,8 @@ function kanbanCard(p){
   // page — keeping cards small means more columns visible without scrolling.
   const checklist = e("div",{class:"kc-checklist"});
   if(!p.cadence.startedAt){
-    checklist.appendChild(e("div",{class:"kc-cl-empty"}, "Cadence not started"));
-    if(canEdit){
-      const startBtn = e("div",{class:"kc-cl-start", onClick:(ev)=>{
-        ev.stopPropagation();
-        startCadence(p);
-        showToast("Cadence started");
-        renderProspectBody();
-      }}, "▶ Start cadence");
-      checklist.appendChild(startBtn);
-    }
+    checklist.appendChild(e("div",{class:"kc-cl-empty"},
+      (p.research && !p.research.error) ? "Assigning cadence\u2026" : "Researching \u2014 cadence auto-assigns next"));
   } else {
     const totalSteps = tpl.steps.length;
     const doneCount  = completedStepCount(p);
@@ -16766,8 +16769,15 @@ function kanbanCard(p){
       item.appendChild(e("div",{class:"kc-cl-text"}, CHANNELS[next.channel]?.short || next.action));
       if(taskProg) item.appendChild(e("div",{class:"kc-cl-progress"}, `${taskProg.done}/${taskProg.total}`));
       checklist.appendChild(item);
-      // Tiny progress strip showing X/Y of the cadence done
-      checklist.appendChild(e("div",{class:"kc-cl-progress-mini"}, `${doneCount}/${totalSteps} steps done`));
+      // Thin progress bar instead of a noisy "X/Y steps done" text line.
+      const pct = totalSteps ? Math.round(doneCount / totalSteps * 100) : 0;
+      const bar = e("div",{class:"kc-prog"});
+      const fill = e("i"); fill.style.width = pct + "%";
+      bar.appendChild(fill);
+      checklist.appendChild(e("div",{class:"kc-prog-row"},
+        bar,
+        e("span",{class:"kc-prog-num"}, `${doneCount}/${totalSteps}`)
+      ));
     }
   }
   card.appendChild(checklist);
@@ -18148,6 +18158,7 @@ async function runResearch(p, opts = {}){
     const userPrompt = buildResearchPrompt(p);
     rawText = await callAnthropic(userPrompt, {
       label: `Research: ${p.firstName} ${p.lastName}`,
+      model: "claude-sonnet-5",
       system: RESEARCH_SYSTEM_PROMPT + voicePromptSegment(state.user),
       maxTokens: 8192,
       tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }],
@@ -18282,7 +18293,7 @@ Reply with raw JSON only. Do NOT wrap your response in code fences (no \`\`\`jso
 
 {
   "photoCandidates": ["public image URLs in order of likely accuracy"],
-  "profile": {"company":"current employer or null", "market":"city, state or null", "nmls":"NMLS number, digits only, or null", "linkedin":"full LinkedIn profile URL or null", "position":"Loan Officer|Senior Loan Officer|Branch Manager|Area Manager or null", "phone":"or null", "email":"or null"},
+  "profile": {"company":"current employer or null", "market":"city, state or null", "nmls":"NMLS number, digits only, or null", "linkedin":"full LinkedIn profile URL or null", "instagram":"Instagram handle (with @) or full profile URL, or null", "position":"Loan Officer|Senior Loan Officer|Branch Manager|Area Manager or null", "phone":"or null", "email":"or null"},
   "summary": "2-3 sentence executive summary of who this person is and why they'd consider Partners",
   "timeline": [{"employer":"", "title":"", "startYear":2019, "endYear":2024, "location":""}],
   "productionEstimate": {"volume":"$25M annually or null", "units":"~80 loans or null", "branchVolume":"or null", "notes":"how you derived these numbers"},
@@ -18306,7 +18317,7 @@ Reply with raw JSON only. Do NOT wrap your response in code fences (no \`\`\`jso
 }
 
 Rules:
-- profile: fill each field ONLY from public evidence (LinkedIn, NMLS Consumer Access, company site). Use null for anything you can't verify. NMLS must be digits only.
+- profile: fill each field ONLY from public evidence (LinkedIn, NMLS Consumer Access, company site, and public social profiles such as Instagram). Use null for anything you can't verify. NMLS must be digits only. For instagram, prefer the @handle.
 - Outreach messages MUST reference specific details from your research. No generic recruiter language.
 - Lead with relationships and operational support, not comp. Partners doesn't outbid; they outserve.
 - Voice notes and SMS should be under 50 words.
@@ -18326,6 +18337,7 @@ function buildResearchPrompt(p){
     p.nmls      ? `NMLS: ${p.nmls}` : null,
     p.email     ? `Email: ${p.email}` : null,
     p.linkedin  ? `LinkedIn: ${p.linkedin}` : null,
+    p.instagram ? `Instagram: ${p.instagram}` : null,
     p.estProduction ? `Existing production estimate: $${p.estProduction}M` : null,
     "",
     p.pain      ? `Recruiter's pain hypothesis (verify or refute): ${p.pain}` : null,
@@ -22372,6 +22384,7 @@ function viewImportExport(){
             createdAt: Date.now()
           };
           state.prospects.push(p); added++;
+          if(typeof queueAutoResearch === "function") queueAutoResearch(p);
         }
         persist();
         showToast(`Imported ${added} prospects`);
@@ -22465,6 +22478,7 @@ function reportCreateProspect(f){
   };
   ensureReportingFields(p);
   state.prospects.push(p);
+  if(typeof queueAutoResearch === "function") queueAutoResearch(p);
   logActivity(p.id, "note", "Added via pipeline report");
   persist();
   return p;
@@ -23155,6 +23169,7 @@ function openProspectModal(existing){
         // Auto-stamp hireDate if stage moved to Closed/Joined and they didn't set one
         if(p.stage === STAGE_CLOSED && !p.hireDate) p.hireDate = Date.now();
         if(!existing) state.prospects.push(p);
+        if(!existing && typeof queueAutoResearch === "function") queueAutoResearch(p);
         ensureReportingFields(p);
         persist(); close(); showToast("Saved");
         navigate("prospect:"+p.id);
@@ -24031,6 +24046,7 @@ if(params.get("u") && params.get("pin")){
       if(p.stage === STAGE_CLOSED && !p.hireDate) p.hireDate = Date.now();
       if(typeof ensureReportingFields === "function") ensureReportingFields(p);
       state.prospects.push(p);
+      if(typeof queueAutoResearch === "function") queueAutoResearch(p);
       if(typeof logActivity === "function") logActivity(p.id, "note", "Added via guided walkthrough");
       persist();
       if(_close) _close();
@@ -24232,7 +24248,7 @@ if(params.get("u") && params.get("pin")){
       row.appendChild(e("button",{class:"btn ghost",onClick:close},"Cancel"));
       row.appendChild(e("button",{class:"btn",onClick:()=>{
         const created = planToProspects(plan);
-        created.forEach(p=>state.prospects.push(p));
+        created.forEach(p=>{ state.prospects.push(p); if(typeof queueAutoResearch === "function") queueAutoResearch(p); });
         persist();
         // record the import (local log, for verification)
         const rec = {
@@ -24856,6 +24872,7 @@ if(params.get("u") && params.get("pin")){
           p.team=ensureTeam(p).filter(m=>(m.name||"").trim()||m.units||m.volume).map(m=>({ id:m.id||("tm_"+uid()), label:m.label||"Loan Officer", name:(m.name||"").trim(), nmls:(m.nmls||"").trim(), units:Number(m.units)||0, volume:Number(m.volume)||0 }));
           if(!existing) state.prospects.push(p);
           p._seed = false;
+          if(!existing && typeof queueAutoResearch === "function") queueAutoResearch(p);
           ensureReportingFields(p);
           persist(); close(); showToast("Saved");
           navigate("prospect:"+p.id);
@@ -25946,6 +25963,7 @@ if(params.get("u") && params.get("pin")){
     setIf("market",   firstFilled(prof.market, recent && recent.location));
     setIf("nmls",     firstFilled(prof.nmls).replace(/\D/g, ""));
     setIf("linkedin", firstFilled(prof.linkedin));
+    setIf("instagram",firstFilled(prof.instagram));
     setIf("phone",    firstFilled(prof.phone));
     setIf("email",    firstFilled(prof.email));
     if(prof.position && isEmpty(p.position)){ p.position = firstFilled(prof.position); filled.push("position"); }
@@ -26289,5 +26307,364 @@ if(params.get("u") && params.get("pin")){
     .topbar .tb-title { display: none; }
   }
 </style>
+
+<!-- ============================================================
+     RECRUIT OS — PIPELINE / KANBAN REDESIGN
+     Calmer, more scannable board: each stage has its own accent color
+     (so the pipeline reads as a flow), the prospect name is the clear
+     hero, secondary info is muted, badges are quiet, and the cadence
+     status collapses to one calm line + a thin stage-colored progress
+     bar instead of a loud red checkbox and a text step-counter.
+     Loaded late so it wins over the base kanban styles.
+     ============================================================ -->
+<style>
+  /* Columns — flat, with a colored top edge per stage */
+  .kanban-col{
+    background:var(--surface); border:1px solid var(--line);
+    border-top:3px solid var(--stage,var(--brand-2));
+    border-radius:12px; box-shadow:none;
+  }
+  .kanban-col-head{
+    background:transparent; border-bottom:1px solid var(--line);
+    padding:12px 13px 10px;
+  }
+  .kanban-col-head .kc-name{ color:var(--t-2); font-size:11.5px; letter-spacing:.05em; }
+  .kanban-col-head .kc-name::before{ background:var(--stage,var(--brand-2)); width:8px; height:8px; }
+  .kanban-col-head .kc-count{
+    background:var(--stage,var(--brand-2)); color:#fff;
+    padding:1px 9px; border-radius:999px; font-size:11px; font-weight:700; opacity:.92;
+  }
+  .kanban-col-body{ gap:9px; padding:9px; }
+
+  /* Cards — flatter, name is the hero, gentle hover lift in the stage color */
+  .k-card{
+    background:var(--surface); border:1px solid var(--line);
+    border-radius:11px; padding:11px 12px; box-shadow:none;
+  }
+  .k-card:hover{
+    border-color:var(--stage,var(--brand));
+    box-shadow:0 2px 10px rgba(15,20,22,.07);
+    transform:translateY(-1px);
+  }
+  .k-card .kc-top{ margin-bottom:3px; }
+  .k-card .kc-av{ width:30px; height:30px; }
+  .k-card .kc-name{ font-size:14px; font-weight:650; color:var(--t-1); }
+  .k-card .kc-meta{ font-size:11.5px; color:var(--t-3); margin-bottom:9px; }
+
+  /* Quieter badges — dollar figure + role read as light text, not chips */
+  .k-card .kc-tier{ background:transparent; color:var(--t-2); font-weight:700; padding:0; }
+  .k-card .kc-tier.high{ background:transparent; color:#b45309; box-shadow:none; }
+  .k-card .kc-tpl-badge{ background:transparent; color:var(--t-3); border:1px solid var(--line); font-weight:600; }
+  .k-card .kc-tpl-badge.ar{ background:transparent; color:#b45309; border-color:rgba(180,83,9,.35); }
+  .k-card .kc-tpl-badge.bm{ background:transparent; color:var(--accent); border-color:var(--line); }
+
+  /* Cadence status line — one calm row, soft checkbox (no glow) */
+  .kc-checklist{ border-top:1px solid var(--line); padding-top:8px; gap:6px; }
+  .kc-cl-item{ padding:1px 0; gap:8px; font-size:12px; }
+  .kc-cl-check{ width:15px; height:15px; border-radius:5px; box-shadow:none !important; }
+  .kc-cl-item.active .kc-cl-check{ border-color:var(--stage,var(--warn)); background:transparent; }
+  .kc-cl-item.overdue .kc-cl-check{ border-color:var(--bad); background:transparent; }
+  .kc-cl-day{
+    width:auto; font-size:10px; padding:1px 6px; border-radius:5px;
+    background:var(--surface-2); color:var(--t-3); letter-spacing:0;
+  }
+  .kc-cl-item.active .kc-cl-day{ color:var(--t-2); }
+  .kc-cl-item.overdue .kc-cl-day{ color:var(--bad); background:rgba(251,80,88,.1); }
+  .kc-cl-text{ font-size:12px; color:var(--t-1); font-weight:500; }
+  .kc-cl-progress{ background:var(--surface-2); color:var(--t-3); }
+
+  /* Thin, stage-colored progress bar (replaces the "X/Y steps done" text) */
+  .kc-prog-row{ display:flex; align-items:center; gap:8px; margin-top:2px; }
+  .kc-prog{ flex:1; height:5px; border-radius:999px; background:var(--surface-2); overflow:hidden; }
+  .kc-prog > i{ display:block; height:100%; border-radius:999px; background:var(--stage,var(--brand)); transition:width .3s; }
+  .kc-prog-num{ font-size:10.5px; color:var(--t-3); font-feature-settings:"tnum"; flex-shrink:0; }
+
+  /* Start-cadence button + empty states — quieter */
+  .kc-cl-start{ background:var(--surface-2); color:var(--t-2); border:1px solid var(--line); font-weight:600; }
+  .kc-cl-start:hover{ border-color:var(--stage,var(--brand)); color:var(--stage,var(--brand-2)); }
+  .kc-cl-empty{ font-style:normal; color:var(--t-3); }
+  .k-empty{ border:1px dashed var(--line-2); border-radius:10px; color:var(--t-3); padding:16px; text-align:center; font-size:12px; }
+</style>
+
+<!-- ============================================================
+     RECRUIT OS — AUTO-RESEARCH ON ADD / IMPORT
+     When a new prospect is created (manual add, CSV/paste import, or the
+     pipeline report), kick off research automatically in the background.
+     Runs one at a time with a gentle throttle so a big import doesn't
+     hammer the gateway, skips sample data and anything already researched,
+     and backs off quietly if offline.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+  var queue = [], busy = false, fails = 0, announced = false, current = null;
+
+  function eligible(p){
+    if(!p || !p.id) return false;
+    if(p._seed) return false;                          // never auto-research sample data
+    if(p.research && !p.research.error) return false;  // already has research
+    return true;
+  }
+
+  window.queueAutoResearch = function(p){
+    if(!eligible(p)) return;
+    if(queue.indexOf(p.id) !== -1) return;
+    if(typeof RS_INFLIGHT !== "undefined" && RS_INFLIGHT && RS_INFLIGHT.has && RS_INFLIGHT.has(p.id)) return;
+    queue.push(p.id);
+    paint();
+    if(!announced){
+      announced = true;
+      if(typeof showToast === "function") showToast("Researching new prospects in the background\u2026");
+      setTimeout(function(){ announced = false; }, 4000);
+    }
+    processQueue();
+  };
+
+  async function processQueue(){
+    if(busy) return;
+    if(typeof window.runResearch !== "function") return;
+    busy = true;
+    while(queue.length){
+      if(typeof navigator !== "undefined" && navigator.onLine === false){
+        if(typeof showToast === "function") showToast("Offline \u2014 new prospects will need research run manually.");
+        queue.length = 0; break;
+      }
+      var id = queue.shift();
+      var p = (state.prospects || []).find(function(x){ return x.id === id; });
+      if(!eligible(p)) continue;
+      current = p; paint();
+      try { await window.runResearch(p, { auto:true }); }
+      catch(e){ console.error("auto-research error", e); }
+      current = null; paint();
+      if(p && p.research && p.research.error){
+        fails++;
+        if(fails >= 2){
+          if(typeof showToast === "function") showToast("Couldn't auto-run research (offline?) \u2014 you can run it manually anytime.");
+          queue.length = 0; break;
+        }
+      } else { fails = 0; }
+      await new Promise(function(r){ setTimeout(r, 900); }); // gentle throttle between runs
+    }
+    busy = false;
+    paint();
+  }
+
+  // ---- Research queue indicator (near the cloud / profile icons) ----
+  function esc(s){ return (s || "").replace(/[&<>"]/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]; }); }
+  function nm(p){ return p ? ((p.firstName || "") + " " + (p.lastName || "")).trim() : ""; }
+  var elWrap = null, expanded = false;
+  function ensureEl(){
+    if(elWrap) return elWrap;
+    elWrap = document.createElement("div");
+    elWrap.id = "research-indicator";
+    elWrap.addEventListener("click", function(){ expanded = !expanded; paint(); });
+    document.body.appendChild(elWrap);
+    return elWrap;
+  }
+  function paint(){
+    var active = !!current || queue.length > 0;
+    var el = ensureEl();
+    if(!active){ el.style.display = "none"; expanded = false; return; }
+    el.style.display = "block";
+    var pending = queue.map(function(id){ return (state.prospects || []).find(function(x){ return x.id === id; }); }).filter(Boolean);
+    var total = (current ? 1 : 0) + pending.length;
+    var head = '<div class="ri-head"><span class="ri-spin"></span>'
+      + '<span class="ri-label">Researching ' + (current ? esc(nm(current)) : "\u2026") + '</span>'
+      + (total > 1 ? '<span class="ri-count">+' + (total - 1) + '</span>' : '') + '</div>';
+    var list = "";
+    if(expanded){
+      var rows = [];
+      if(current) rows.push('<div class="ri-row"><span class="ri-dot"></span>' + esc(nm(current)) + '<span class="ri-tag">now</span></div>');
+      pending.forEach(function(pp){ rows.push('<div class="ri-row"><span class="ri-dot q"></span>' + esc(nm(pp)) + '<span class="ri-tag">queued</span></div>'); });
+      list = '<div class="ri-list">' + rows.join("") + '</div>';
+    }
+    el.innerHTML = head + list;
+  }
+
+  var riStyle = document.createElement("style");
+  riStyle.textContent = [
+    "#research-indicator{display:none;position:fixed;top:64px;right:16px;z-index:80;background:var(--surface,#fff);border:1px solid var(--line,#e5e7eb);border-radius:12px;box-shadow:0 6px 24px rgba(15,20,22,.12);padding:9px 12px;font-size:12.5px;color:var(--t-1,#0f1416);cursor:pointer;max-width:280px}",
+    "#research-indicator .ri-head{display:flex;align-items:center;gap:8px}",
+    "#research-indicator .ri-label{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:180px}",
+    "#research-indicator .ri-count{margin-left:auto;background:var(--brand-soft,#e6f2f3);color:var(--brand-2,#00818B);border-radius:999px;padding:1px 8px;font-weight:700;font-size:11px}",
+    "#research-indicator .ri-spin{width:13px;height:13px;border-radius:50%;border:2px solid var(--brand-soft,#cde);border-top-color:var(--brand-2,#00818B);flex:0 0 auto;animation:riSpin .8s linear infinite}",
+    "@keyframes riSpin{to{transform:rotate(360deg)}}",
+    "#research-indicator .ri-list{margin-top:8px;border-top:1px solid var(--line,#eee);padding-top:7px;display:flex;flex-direction:column;gap:6px;max-height:220px;overflow:auto}",
+    "#research-indicator .ri-row{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--t-2,#444)}",
+    "#research-indicator .ri-dot{width:7px;height:7px;border-radius:50%;background:var(--brand-2,#00818B);flex:0 0 auto}",
+    "#research-indicator .ri-dot.q{background:var(--t-3,#9aa)}",
+    "#research-indicator .ri-tag{margin-left:auto;font-size:10px;color:var(--t-3,#9aa);text-transform:uppercase;letter-spacing:.04em}",
+    "@media(max-width:760px){#research-indicator{top:auto;bottom:82px;right:10px;left:10px;max-width:none}}"
+  ].join("");
+  document.head.appendChild(riStyle);
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — PIPELINE FLOW (6 STAGES + ENGAGED ⇒ CHECKLIST)
+     Pipeline is New Prospect → Engaging → Engaged → LOI Out →
+     Closed/Joined → Long Term Nurture. New prospects auto-research on
+     creation, then the system assigns the best-fit cadence and moves
+     them to Engaging (no manual start). The moment a prospect lands in
+     Engaged they switch to Peter's Playbook checklist — enforced on
+     every save. Old Deeper Dive folds to Engaged; other legacy stages
+     fold to Engaging.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+  var CANON = ["new","engaging","engaged","loi","closed","nurture"];
+  var CANON_STAGES = [
+    { id:"new",      label:"New Prospect"      },
+    { id:"engaging", label:"Engaging"          },
+    { id:"engaged",  label:"Engaged"           },
+    { id:"loi",      label:"LOI Out"           },
+    { id:"closed",   label:"Closed/Joined"     },
+    { id:"nurture",  label:"Long Term Nurture" }
+  ];
+
+  function phaseDone(p, step){
+    var comp = (p.cadence && p.cadence.completed) || [];
+    if(comp.some(function(c){ return c.stepId === step.id && !c.taskId; })) return true;
+    if(step.tasks && step.tasks.length){
+      return step.tasks.every(function(t){ return comp.some(function(c){ return c.stepId === step.id && c.taskId === t.id; }); });
+    }
+    return false;
+  }
+
+  function setPlaybook(p){
+    if(!p.cadence) return;
+    p.cadence.templateId = "active-recruit";
+    var tpl = (typeof getTemplateById === "function") ? getTemplateById("active-recruit") : null;
+    if(tpl && tpl.steps){
+      var valid = {}; tpl.steps.forEach(function(s){ valid[s.id] = 1; });
+      p.cadence.completed = (p.cadence.completed || []).filter(function(c){ return valid[c.stepId]; });
+      p.cadence.skipped   = (p.cadence.skipped   || []).filter(function(s){ return valid[s.stepId]; });
+    }
+    if(!p.cadence.startedAt) p.cadence.startedAt = Date.now();
+    p.cadence.paused = false;
+  }
+
+  function normalizeOne(p){
+    if(!p || !p.cadence) return false;
+    var before = p.stage + "|" + p.cadence.templateId;
+    if(p.stage === "deep") p.stage = "engaged";                 // old Deeper Dive → Engaged (checklist)
+    else if(CANON.indexOf(p.stage) === -1) p.stage = "engaging"; // any other removed/custom stage → Engaging
+    if(p.stage === "engaged" && p.cadence.templateId !== "active-recruit") setPlaybook(p);
+    return (p.stage + "|" + p.cadence.templateId) !== before;
+  }
+  function normalizeAll(){
+    var n = 0;
+    (state.prospects || []).forEach(function(p){ if(normalizeOne(p)) n++; });
+    return n;
+  }
+  window.normalizeProspectFlow = normalizeAll;
+
+  // ---- Auto-cadence: after research, the system picks the best-fit cadence ----
+  function isBMish(p){
+    if(typeof isBM === "function"){ try { return isBM(p); } catch(e){} }
+    var pos = (p.position || "").toLowerCase();
+    return pos.indexOf("branch") !== -1 || pos.indexOf("area manager") !== -1
+        || (Array.isArray(p.team) && p.team.length > 0)
+        || (p.cadence && p.cadence.templateId === "bm");
+  }
+  // Overridable best-fit pick. Branch/Area managers → BM track; everyone else → LO track.
+  function bestFitCadence(p){ return isBMish(p) ? "bm" : "lo"; }
+  window.bestFitCadence = bestFitCadence;
+
+  // Auto-start the best-fit cadence and move a brand-new prospect into Engaging.
+  function autoAssignCadence(p){
+    if(!p || !p.cadence) return false;
+    if(p.stage !== "new") return false;      // only brand-new prospects
+    if(p.cadence.startedAt) return false;    // already running
+    var tpl = bestFitCadence(p);
+    if(typeof getTemplateById === "function" && !getTemplateById(tpl)) tpl = p.cadence.templateId || "lo";
+    p.cadence.templateId = tpl;
+    p.cadence.startedAt = Date.now();
+    p.cadence.paused = false;
+    p.stage = "engaging";
+    if(typeof logActivity === "function") logActivity(p.id, "cadence-started", "Auto-assigned " + tpl.toUpperCase() + " cadence (best fit) after research");
+    persist();
+    return true;
+  }
+  window.autoAssignCadence = autoAssignCadence;
+
+  // After research runs (or fails), assign the best-fit cadence → Engaging.
+  if(typeof window.runResearch === "function"){
+    var _rr = window.runResearch;
+    window.runResearch = async function(p, opts){
+      try { return await _rr(p, opts); }
+      finally {
+        try { if(autoAssignCadence(p) && typeof navigate === "function") navigate(state.screen, { replace:true }); } catch(e){}
+      }
+    };
+  }
+
+  // Enforce on every save — whoever lands in Engaged picks up the checklist.
+  if(typeof window.persist === "function"){
+    var _persist = window.persist;
+    window.persist = function(){
+      try { normalizeAll(); } catch(e){ console.error("flow normalize", e); }
+      return _persist.apply(this, arguments);
+    };
+  }
+
+  // Clean Kanban card for checklist prospects: current phase + phase progress.
+  if(typeof window.kanbanCard === "function"){
+    var _card = window.kanbanCard;
+    window.kanbanCard = function(p){
+      var card = _card(p);
+      try {
+        if(p && p.cadence && p.cadence.templateId === "active-recruit" && p.cadence.startedAt){
+          var cl = card.querySelector(".kc-checklist");
+          if(cl){
+            var tpl = getTemplate(p);
+            var steps = (tpl && tpl.steps) || [];
+            var total = steps.length || 7;
+            var done = steps.filter(function(s){ return phaseDone(p, s); }).length;
+            var next = null;
+            for(var i = 0; i < steps.length; i++){ if(!phaseDone(p, steps[i])){ next = steps[i]; break; } }
+            var pct = total ? Math.round(done / total * 100) : 0;
+            cl.innerHTML = "";
+            cl.appendChild(e("div",{class:"kc-cl-item active"},
+              e("div",{class:"kc-cl-day"}, "\u2713 List"),
+              e("div",{class:"kc-cl-text"}, next ? next.action : "Checklist complete")
+            ));
+            var bar = e("div",{class:"kc-prog"}); var fill = e("i"); fill.style.width = pct + "%"; bar.appendChild(fill);
+            cl.appendChild(e("div",{class:"kc-prog-row"}, bar, e("span",{class:"kc-prog-num"}, done + "/" + total)));
+          }
+        }
+      } catch(e){ console.error("card flow", e); }
+      return card;
+    };
+  }
+
+  // One-time: collapse to the 5 stages + fold stranded prospects, then re-render.
+  function migrateStages(){
+    try {
+      var already = false;
+      try { already = localStorage.getItem("pm_recruit_stages_v6") === "1"; } catch(e){}
+      var changed = normalizeAll() > 0;
+      if(!already){
+        state.stages = CANON_STAGES.map(function(s){ return { id:s.id, label:s.label }; });
+        try { localStorage.setItem("pm_recruit_stages_v6", "1"); } catch(e){}
+        changed = true;
+      }
+      if(changed){
+        persist();
+        if(typeof navigate === "function") navigate(state.screen, { replace:true });
+      }
+      // Unstick any pre-existing New prospects into the auto-flow:
+      // already researched → assign now; otherwise queue research (which assigns on completion).
+      (state.prospects || []).forEach(function(p){
+        if(!p || p.stage !== "new" || (p.cadence && p.cadence.startedAt)) return;
+        if(p.research && !p.research.error){ autoAssignCadence(p); }
+        else if(typeof queueAutoResearch === "function"){ queueAutoResearch(p); }
+      });
+    } catch(e){ console.error("stage migrate", e); }
+  }
+  setTimeout(migrateStages, 700); // defer so cloud/local data has loaded first
+})();
+</script>
 </body>
 </html>
