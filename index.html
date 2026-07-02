@@ -2571,21 +2571,6 @@ details[open] .api-key-summary svg.chev{transform:rotate(180deg)}
       </div>
       <p class="ai-panel-desc">Claude searches the web for this specific prospect — LinkedIn, Zillow, NMLS, press mentions, recent posts — then writes a personalized opener grounded in what it finds. Results populate the notes field too, so you have receipts.</p>
 
-      <!-- API key (shared pattern with loan tool) -->
-      <details class="api-key-wrap" id="apiKeyDetails">
-        <summary class="api-key-summary">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--teal)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="5"/><path d="M13 15h8M17 12v6M21 12v6"/></svg>
-          <span>Anthropic API Key</span>
-          <span class="api-key-status no" id="api-key-status">Not set</span>
-          <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"/></svg>
-        </summary>
-        <div class="api-key-body">
-          <input id="anthropicApiKey" class="api-key-input" type="password" placeholder="sk-ant-..." autocomplete="off" oninput="saveApiKey(this.value)">
-          <button class="btn btn-ghost btn-sm" onclick="clearApiKey()">Clear</button>
-          <div style="font-family:var(--font-h);font-size:10px;color:var(--gray-400);width:100%;margin-top:4px">Stored only in this browser. Shared with the loan comparison tool. Web search requires your Anthropic account to have it enabled.</div>
-        </div>
-      </details>
-
       <div style="display:flex;gap:8px;flex-wrap:wrap">
         <button class="btn btn-primary" onclick="generateOpener()" id="btn-gen-opener">🔎 Research Online + Generate Opener</button>
         <button class="btn btn-ghost" onclick="copyResearchPrompt()" title="Copy a prompt to paste into Claude.ai or ChatGPT with web search on">📋 Copy Prompt (manual)</button>
@@ -3202,11 +3187,6 @@ function copyResearchPrompt() {
 }
 
 async function generateOpener() {
-  if (!window._apiKey) {
-    toast('Add your Anthropic API key first (or use Copy Prompt)', '⚠');
-    document.getElementById('apiKeyDetails').open = true;
-    return;
-  }
   syncState();
   const p = state.prospect;
   if (!p.firstName || !p.lastName) { toast('Enter prospect\'s full name first', '⚠'); return; }
@@ -3217,13 +3197,10 @@ async function generateOpener() {
 
   try {
     const prompt = buildResearchPrompt();
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const res = await fetch('https://pm-gateway.partnersmortgage88.workers.dev/anthropic', {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': window._apiKey,
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-5',
@@ -14672,7 +14649,7 @@ refreshAll = function() {
      =========================================================================== -->
 <script type="module">
   import { initializeApp }       from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-  import { getFirestore, doc, getDoc, setDoc, onSnapshot, collection, getDocs, writeBatch }
+  import { getFirestore, doc, getDoc, setDoc, onSnapshot }
                                  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
   import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject }
                                  from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
@@ -14698,8 +14675,7 @@ refreshAll = function() {
     // Anonymous sign-in so Firestore rules can require auth without forcing email/password yet.
     // Enable Anonymous in Firebase Console → Authentication → Sign-in method.
     signInAnonymously(auth).catch(err => {
-      console.warn("[firebase] anonymous sign-in failed — check Auth providers + Authorized domains in Firebase Console", err);
-      try { window.dispatchEvent(new CustomEvent("firebase-auth-failed", { detail: { message: (err && err.message) || String(err) } })); } catch(e){}
+      console.warn("[firebase] anonymous sign-in failed — check Auth providers in Firebase Console", err);
     });
 
     onAuthStateChanged(auth, user => {
@@ -14711,7 +14687,7 @@ refreshAll = function() {
     window._fb = {
       ready: true,
       app, fdb, stg, auth,
-      doc, getDoc, setDoc, onSnapshot, collection, getDocs, writeBatch,
+      doc, getDoc, setDoc, onSnapshot,
       ref, uploadBytes, getDownloadURL, deleteObject
     };
     window.dispatchEvent(new CustomEvent("firebase-ready"));
@@ -14751,7 +14727,7 @@ window._fbReady = new Promise(resolve => {
    stub that returns recruiter-shaped output for testing.
    =========================================================================== */
 const CONFIG = {
-  anthropicKey: "",                     // set per-user in Settings
+  anthropicKey: "gateway",              // auth is added by the Cloudflare Worker gateway — no per-user key
   anthropicModel: "claude-sonnet-4-6",  // override in Settings if needed
   appName: "Partners Recruit OS"
 };
@@ -14765,7 +14741,7 @@ const CONFIG = {
 const USERS = [
   { id:"leif",    name:"Leif Boyd",       email:"lboyd@partnersmortgage.com",     pin:"", role:"admin",     title:"President" },
   { id:"dan",     name:"Dan Trinidad",    email:"dtrinidad@partnersmortgage.com", pin:"", role:"admin",     title:"CEO / Founder" },
-  { id:"peter",   name:"Peter Schwartz",  email:"pschwartz@partnersmortgage.com", pin:"", role:"admin",     title:"EVP Business Development" },
+  { id:"peter",   name:"Peter Schwartz",  email:"pschwartz@partnersmortgage.com", pin:"", role:"recruiter", title:"EVP Business Development" },
   { id:"jason",   name:"Jason Malmstrom", email:"jmalmstrom@partnersmortgage.com",pin:"", role:"recruiter", title:"Production Leader" },
   { id:"matt",    name:"Matt Perez",      email:"mperez@partnersmortgage.com",    pin:"", role:"recruiter", title:"Production Leader" },
   { id:"aidan",   name:"Aidan Boyd",      email:"aboyd@partnersmortgage.com",     pin:"", role:"admin", title:"Biz Dev Assoc" }
@@ -15537,40 +15513,6 @@ function makeSeedProspects(){
   });
 }
 
-/* ---------------------------------------------------------------------------
-   SAMPLE-DATA DETECTION
-   The built-in starter roster (makeSeedProspects) uses distinctive `source`
-   labels ("Hires – Apr 2026", "Report Import", "LOI Out", etc.). Records saved
-   by an older build never received the _seed flag, so we re-detect them by a
-   name + source signature and tag them. Tagged samples are hidden from every
-   view and never pushed to the team master — so a stray sample can never show
-   up as a duplicate next to a real prospect. This only flags records that match
-   the built-in roster exactly; anything a person typed or imported is left alone.
-   --------------------------------------------------------------------------- */
-let _seedSigSet = null;
-function seedSig(p){
-  return ((p.firstName||"") + "\u0000" + (p.lastName||"") + "\u0000" + (p.source||"") +
-          "\u0000" + (p.stage||"") + "\u0000" + String(p.estProduction != null ? p.estProduction : "")).toLowerCase();
-}
-function seedSignatureSet(){
-  if(_seedSigSet) return _seedSigSet;
-  _seedSigSet = new Set();
-  try{
-    const base = (typeof makeSeedProspects === "function") ? makeSeedProspects() : [];
-    base.forEach(function(p){ if(p) _seedSigSet.add(seedSig(p)); });
-  }catch(e){}
-  return _seedSigSet;
-}
-function isSampleProspect(p){
-  if(!p) return false;
-  if(p._seed) return true;
-  return seedSignatureSet().has(seedSig(p));
-}
-function markSeedIfSample(p){
-  if(p && !p._seed && isSampleProspect(p)) p._seed = true;
-  return p;
-}
-
 /* ===========================================================================
    STORAGE / DATA LAYER
    ---------------------------------------------------------------------------
@@ -15788,6 +15730,7 @@ async function syncFromCloudOnBoot(){
     state.videoLibrary     = cloud.videoLibrary     || [];
     state.brandFacts       = (typeof cloud.brandFacts === "string") ? cloud.brandFacts : null;
     // state.stages already set above (always pulled)
+    if(cloud.contentLinks && typeof cloud.contentLinks === "object") state.contentLinks = cloud.contentLinks;
     state.lastModified     = cloudTime;
     // Heal any legacy stage values that arrived in the cloud prospects (e.g.
     // someone on an old cached tab wrote prospects with "New Prospect" instead
@@ -15820,6 +15763,7 @@ const state = {
   brandFacts: null,            // admin-editable talking points injected into all AI prompts; null = use DEFAULT_BRAND_FACTS
   reportNote: "",              // free-text leadership note shown on the pipeline report
   stages: null,                // admin-editable pipeline stages: array of {id,label}. null = use DEFAULT_STAGES
+  contentLinks: {},            // What's Working Now: editable share links keyed by item id (synced)
   lastModified: 0,             // timestamp of last user-driven change (used for sync)
   filters: { q:"", stage:"all", recruiter:"all", tier:"all", due:"all", tag:"all" },
   history: [],                 // back-stack
@@ -15850,30 +15794,11 @@ function stateToPersist(){
     brandFacts:       state.brandFacts,
     reportNote:       state.reportNote,
     stages:           state.stages || null,
+    contentLinks:     state.contentLinks || {},
     lastModified:    state.lastModified
   };
 }
 
-/* Code is the source of truth for identity fields (role, title, name, email).
-   Re-applies them onto state.users so a promotion in USERS (e.g. Peter → admin)
-   always wins, even over a stale `users` doc adopted from the cloud. Preserves
-   user-set fields like PIN and photo. Also refreshes the logged-in user object. */
-function reconcileUsersWithCode(){
-  if(!Array.isArray(state.users)) state.users = USERS.slice();
-  USERS.forEach(def => {
-    const existing = state.users.find(u => u.id === def.id);
-    if(!existing){ state.users.push(Object.assign({}, def)); return; }
-    ["role","title","name","email"].forEach(field => {
-      if(def[field] !== undefined) existing[field] = def[field];
-    });
-  });
-  const validIds = new Set(USERS.map(u => u.id));
-  state.users = state.users.filter(u => validIds.has(u.id));
-  if(state.user){
-    const me = state.users.find(u => u.id === state.user.id);
-    if(me) state.user = me;
-  }
-}
 function loadState(){
   const saved = db.get();
   if(saved){
@@ -15916,13 +15841,9 @@ function loadState(){
     if(usersChanged) persist();
     // Backfill reporting fields on every prospect — safe to run repeatedly.
     state.prospects.forEach(ensureReportingFields);
-    // Flag any leftover built-in sample records saved by an older build, so they
-    // stay hidden and never sync as duplicates of real prospects.
-    state.prospects.forEach(markSeedIfSample);
-    if(!state.prospects.length){ state.prospects = makeSeedProspects(); state.prospects.forEach(p => { if(p) p._seed = true; }); }
+    if(!state.prospects.length) state.prospects = makeSeedProspects();
   } else {
     state.prospects = makeSeedProspects();
-    state.prospects.forEach(p => { if(p) p._seed = true; });
     state.activities = seedActivity(state.prospects);
     state.lastModified = 0;
     // Write seeds to localStorage but DO NOT bump lastModified — seeds shouldn't
@@ -16449,7 +16370,9 @@ function viewDashboard(){
     wrap.appendChild(banner);
   }
 
-  const myProspects = state.prospects.filter(p => p && !p._seed);
+  const myProspects = state.prospects.filter(p =>
+    state.user.role === "admin" || state.user.role === "viewer" || p.assignedTo === state.user.id
+  );
 
   // Compute cadence-based queues
   const cadenceDueToday = [];
@@ -16468,13 +16391,19 @@ function viewDashboard(){
   const engaged  = myProspects.filter(p => [STAGE_ENGAGED, STAGE_DEEP, STAGE_LOI].includes(p.stage));
   const appts    = myProspects.filter(p => p.appointmentStatus === "scheduled");
 
+  // Accurate touch counts — matches the What to Work on Now list. Falls back to the
+  // legacy step model only if the work-list helper isn't loaded yet.
+  const dc = (typeof window.dueCounts === "function")
+    ? window.dueCounts(myProspects)
+    : { today: cadenceDueToday.length, overdue: cadenceOverdue.length, total: cadenceDueToday.length + cadenceOverdue.length };
+
   // Greeting
   const hour = new Date().getHours();
   const greet = hour<12?"Good morning":hour<18?"Good afternoon":"Good evening";
   wrap.appendChild(e("div",{class:"h-section"},
     e("div",{},
       e("h2",{},`${greet}, ${state.user.name.split(" ")[0]}.`),
-      e("div",{class:"sub"},`${myProspects.length} prospects · ${cadenceOverdue.length+cadenceDueToday.length} cadence touches due`)
+      e("div",{class:"sub"},`${myProspects.length} prospects · ${dc.total} cadence touches due`)
     )
   ));
 
@@ -16485,8 +16414,8 @@ function viewDashboard(){
     e("div",{class:"val"},String(val)),
     sub ? e("div",{class:"delta"},sub) : null
   )}
-  kpis.appendChild(kpi("Today",     cadenceDueToday.length, "cadence touches",  cadenceDueToday.length?"accent":""));
-  kpis.appendChild(kpi("Overdue",   cadenceOverdue.length,  "need attention",   cadenceOverdue.length?"bad":""));
+  kpis.appendChild(kpi("Today",     dc.today,   "cadence touches",  dc.today?"accent":""));
+  kpis.appendChild(kpi("Overdue",   dc.overdue, "need attention",   dc.overdue?"bad":""));
   kpis.appendChild(kpi("Engaged",   engaged.length,         "in conversation",  engaged.length?"good":""));
   kpis.appendChild(kpi("Appts",     appts.length,           "scheduled",        appts.length?"accent":""));
   wrap.appendChild(kpis);
@@ -16495,54 +16424,9 @@ function viewDashboard(){
   const intel = renderWhoToReachNext(myProspects);
   if(intel) wrap.appendChild(intel);
 
-  // Today's cadence touches — grouped by channel
-  const allDue = cadenceOverdue.concat(cadenceDueToday);
-  if(allDue.length){
-    wrap.appendChild(e("div",{class:"h-section"},
-      e("div",{}, e("h2",{},"Today's touches"), e("div",{class:"sub"},"Cadence steps that need attention right now"))
-    ));
-    // Group by channel
-    const groups = {};
-    allDue.forEach(({p,step}) => {
-      if(!groups[step.channel]) groups[step.channel] = [];
-      groups[step.channel].push({p,step});
-    });
-    const qa = e("div",{class:"qa-grid"});
-    Object.keys(groups).forEach(channel => {
-      const ch = CHANNELS[channel] || {};
-      const items = groups[channel];
-      qa.appendChild(quickAction(
-        ch.label || channel,
-        items.length === 1
-          ? `${items[0].p.firstName} ${items[0].p.lastName} — ${ch.short || channel}`
-          : `${items.length} prospects need this touch today`,
-        items.length,
-        ()=> navigate("prospect:"+items[0].p.id)
-      ));
-    });
-    wrap.appendChild(qa);
-
-    // Show the actual prospects that need the touches (top 5)
-    const list = e("div",{class:"list",style:"margin-top:12px"});
-    allDue.slice(0,5).forEach(({p,step}) => {
-      const ch = CHANNELS[step.channel] || {};
-      list.appendChild(e("button",{class:"row-card",onClick:()=>navigate("prospect:"+p.id)},
-        e("div",{class:"rc-avatar"}, initials(p.firstName+" "+p.lastName)),
-        e("div",{class:"rc-main"},
-          e("div",{class:"rc-name"}, `${p.firstName} ${p.lastName}`),
-          e("div",{class:"rc-meta"},
-            e("span",{}, p.company||"—"),
-            e("span",{}, "·"),
-            e("span",{style:"color:"+(stepStatus(p,step)==="overdue"?"var(--bad)":"var(--warn)")}, `Day ${step.day}: ${ch.short||step.action}`)
-          )
-        ),
-        e("div",{class:"rc-aside"},
-          e("span",{class:"pill "+(stepStatus(p,step)==="overdue"?"bad":"warn")}, stepStatus(p,step)==="overdue" ? "Overdue" : "Today")
-        )
-      ));
-    });
-    wrap.appendChild(list);
-  }
+  // NOTE: the legacy "Today's touches" list here was removed — it ran on the old
+  // template-step model and could contradict the KPI numbers and the accurate
+  // "What to Work on Now" panel rendered just above (renderWhoToReachNext).
 
   // Other useful actions
   wrap.appendChild(e("div",{class:"h-section",style:"margin-top:18px"},
@@ -16656,8 +16540,7 @@ function viewProspects(){
   TIERS.forEach(t => { const o = e("option",{value:t},t); if(f.tier===t) o.selected=true; tierSel.appendChild(o) });
   filterRow.appendChild(tierSel);
 
-  {
-    // Recruiter filter available to everyone, so all logins see the same controls.
+  if(state.user.role === "admin"){
     const recSel = e("select",{onChange:ev=>{state.filters.recruiter=ev.target.value;renderProspectBody()}});
     recSel.appendChild(e("option",{value:"all"},"All recruiters"));
     state.users.filter(u=>u.role!=="viewer").forEach(u => {
@@ -17075,10 +16958,10 @@ function tdCleanup(){
 
 function visibleProspects(){
   const f = state.filters;
-  let arr = state.prospects.filter(p => p && !p._seed);
-  // Everyone sees the full team pipeline. The recruiter dropdown is an optional
-  // filter available to all roles (not a hard per-user scope).
-  if(f.recruiter && f.recruiter !== "all"){
+  let arr = state.prospects.slice();
+  if(state.user.role !== "admin" && state.user.role !== "viewer"){
+    arr = arr.filter(p => p.assignedTo === state.user.id);
+  } else if(f.recruiter !== "all"){
     arr = arr.filter(p => p.assignedTo === f.recruiter);
   }
   if(f.q){
@@ -17310,27 +17193,6 @@ function viewProspectDetail(p){
   actionsRow.appendChild(renderActionsMenu(p));
   wrap.appendChild(actionsRow);
 
-  // Intelligence readout — engagement + recruitability + top behavioral trigger.
-  (function(){
-    const eng = engagementScore(p), rec = recruitabilityScore(p);
-    const trigs = behavioralTriggers(p);
-    const strip = e("div",{class:"intel-strip"});
-    strip.appendChild(e("div",{class:"intel-stat"},
-      e("span",{class:"intel-stat-dot "+scoreTone(eng)}),
-      e("span",{class:"intel-stat-label"},"Engagement"),
-      e("span",{class:"intel-stat-val"}, String(eng))
-    ));
-    strip.appendChild(e("div",{class:"intel-stat"},
-      e("span",{class:"intel-stat-dot "+scoreTone(rec)}),
-      e("span",{class:"intel-stat-label"},"Recruitability"),
-      e("span",{class:"intel-stat-val"}, String(rec))
-    ));
-    if(trigs.length){
-      strip.appendChild(e("span",{class:"intel-trigger k-"+trigs[0].kind}, trigs[0].label));
-    }
-    wrap.appendChild(strip);
-  })();
-
   // Tabs
   const tabs = e("div",{class:"pd-tabs"});
   const TABS = ["Playbook","Research","Overview","Activity","Notes","Files"];
@@ -17462,7 +17324,7 @@ function renderActionsMenu(p){
   pop.appendChild(item("Generate text", iconGen(),  ()=>quickAI(p, "First touch SMS")));
   pop.appendChild(item("LinkedIn DM",   iconLi(),   ()=>quickAI(p, "LinkedIn connection request")));
   pop.appendChild(item("Call prep",     iconCall(), ()=>quickAI(p, "Call prep notes")));
-  pop.appendChild(item("Warm nudge",    iconNudge(),()=>openWarmNudgePicker(p)));
+  pop.appendChild(item("Warm outreach", iconNudge(),()=>openWarmNudgePicker(p)));
   pop.appendChild(e("div", { class:"act-sep" }));
   pop.appendChild(e("div", { class:"act-group-label" }, "Presentations"));
   pop.appendChild(item("WOW presentation", iconWow(), ()=>openWow(p)));
@@ -18273,11 +18135,6 @@ function pdActivity(p){
 const RS_INFLIGHT = new Set(); // prospectIds currently being researched
 
 async function runResearch(p, opts = {}){
-  if(!CONFIG.anthropicKey){
-    showToast("Add your Anthropic API key in Settings first");
-    navigate("settings");
-    return;
-  }
   if(RS_INFLIGHT.has(p.id)){ showToast("Research already running…"); return; }
   RS_INFLIGHT.add(p.id);
   // Clear any prior error so the loading UI shows
@@ -18425,6 +18282,7 @@ Reply with raw JSON only. Do NOT wrap your response in code fences (no \`\`\`jso
 
 {
   "photoCandidates": ["public image URLs in order of likely accuracy"],
+  "profile": {"company":"current employer or null", "market":"city, state or null", "nmls":"NMLS number, digits only, or null", "linkedin":"full LinkedIn profile URL or null", "position":"Loan Officer|Senior Loan Officer|Branch Manager|Area Manager or null", "phone":"or null", "email":"or null"},
   "summary": "2-3 sentence executive summary of who this person is and why they'd consider Partners",
   "timeline": [{"employer":"", "title":"", "startYear":2019, "endYear":2024, "location":""}],
   "productionEstimate": {"volume":"$25M annually or null", "units":"~80 loans or null", "branchVolume":"or null", "notes":"how you derived these numbers"},
@@ -18448,6 +18306,7 @@ Reply with raw JSON only. Do NOT wrap your response in code fences (no \`\`\`jso
 }
 
 Rules:
+- profile: fill each field ONLY from public evidence (LinkedIn, NMLS Consumer Access, company site). Use null for anything you can't verify. NMLS must be digits only.
 - Outreach messages MUST reference specific details from your research. No generic recruiter language.
 - Lead with relationships and operational support, not comp. Partners doesn't outbid; they outserve.
 - Voice notes and SMS should be under 50 words.
@@ -20025,7 +19884,7 @@ function lockSvg(){
    so it still works in the sandbox / offline. Returns { outcome, summary }. */
 async function analyzeReply(p, task, replyText){
   const valid = ["replied-interested","asked-info","booked-call","replied-not-now","shut-down"];
-  if(CONFIG.anthropicKey){
+  if(true){
     try {
       const sys = "You are a recruiting strategist for a mortgage company. A recruiter sent a prospect an outreach message; the prospect replied. Classify the reply and pick the single best next move. Reply with JSON ONLY (no prose, no fences). Schema: { outcome: string, summary: string }. outcome MUST be exactly one of: \"replied-interested\" (warm, curious, positive, wants to keep talking), \"asked-info\" (asking a question or wants specifics/numbers), \"booked-call\" (agreed to a call/meeting or proposed a time), \"replied-not-now\" (open but bad timing / later), \"shut-down\" (clearly not interested or asking to stop). summary = one short sentence explaining the read.";
       const prompt = "Recruiter's outreach: " + (task.action || "a message") + " (" + ((CHANNELS[task.channel] && CHANNELS[task.channel].label) || task.channel || "message") + ").\n\nProspect " + p.firstName + " " + p.lastName + " replied:\n\"\"\"\n" + replyText + "\n\"\"\"\n\nClassify the outcome and pick the next move.";
@@ -20840,7 +20699,7 @@ function aiLogUpdate(entry, patch){
 }
 
 async function callAnthropic(userPrompt, opts = {}){
-  if(!CONFIG.anthropicKey) throw new Error("No API key set");
+  // Auth is added by the Cloudflare Worker gateway — no local API key required.
   const body = {
     model: opts.model || CONFIG.anthropicModel,
     max_tokens: opts.maxTokens || 1024,
@@ -20866,13 +20725,10 @@ async function callAnthropic(userPrompt, opts = {}){
   try {
     aiLogUpdate(entry, { phase: "waiting" });
     if(opts.onProgress) opts.onProgress(entry);
-    r = await fetch("https://api.anthropic.com/v1/messages", {
+    r = await fetch("https://pm-gateway.partnersmortgage88.workers.dev/anthropic", {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "x-api-key": CONFIG.anthropicKey,
-        "anthropic-version": "2023-06-01",
-        "anthropic-dangerous-direct-browser-access": "true"
+        "Content-Type": "application/json"
       },
       body: JSON.stringify(body),
       signal: ctrl.signal
@@ -21547,22 +21403,13 @@ function viewSettings(){
     e("div",{}, e("h2",{},"Settings"))
   ));
 
-  // Anthropic API key (per-user, localStorage only, never sent to a server)
+  // AI model — auth is handled by the Partners gateway, so there's no key to manage.
   const aiCard = e("div",{class:"card"});
-  aiCard.appendChild(e("h3",{style:"margin:0 0 8px;font-size:14px"},"Anthropic API key"));
+  aiCard.appendChild(e("h3",{style:"margin:0 0 8px;font-size:14px"},"AI model"));
   aiCard.appendChild(e("p",{class:"muted",style:"font-size:12.5px;margin:0 0 10px"},
-    "Each recruiter enters their own API key. It's stored on this device only and sent directly to api.anthropic.com — never to a Partners server. Get a key at console.anthropic.com → API Keys."
+    "AI research and message generation run through the Partners gateway. No API key is needed — nothing to enter or manage."
   ));
-  const keyInput = e("input",{
-    type:"password",
-    placeholder:"sk-ant-...",
-    value: CONFIG.anthropicKey,
-    autocomplete:"off",
-    spellcheck:"false"
-  });
-  aiCard.appendChild(keyInput);
-
-  aiCard.appendChild(e("label",{style:"font-size:12px;color:var(--t-2);display:block;margin:12px 0 4px"},"Model"));
+  aiCard.appendChild(e("label",{style:"font-size:12px;color:var(--t-2);display:block;margin:0 0 4px"},"Model"));
   const modelSelect = e("select",{},
     e("option",{value:"claude-sonnet-4-6"}, "Claude Sonnet 4.6 — recommended"),
     e("option",{value:"claude-opus-4-7"},   "Claude Opus 4.7 — slowest, most capable"),
@@ -21570,46 +21417,13 @@ function viewSettings(){
   );
   modelSelect.value = CONFIG.anthropicModel;
   aiCard.appendChild(modelSelect);
-
-  const statusLine = e("p",{class:"muted",style:"font-size:11.5px;margin:10px 0 0"},
-    CONFIG.anthropicKey ? "✓ Key set — AI calls go to Anthropic" : "No key — AI uses mock generator"
-  );
-  aiCard.appendChild(statusLine);
-
-  aiCard.appendChild(e("div",{style:"margin-top:10px;display:flex;gap:8px;flex-wrap:wrap"},
+  aiCard.appendChild(e("div",{style:"margin-top:10px"},
     e("button",{class:"btn sm",onClick:()=>{
-      CONFIG.anthropicKey   = keyInput.value.trim();
       CONFIG.anthropicModel = modelSelect.value;
-      try { localStorage.setItem("recruit_anthropic_key",   CONFIG.anthropicKey);   } catch(e){}
       try { localStorage.setItem("recruit_anthropic_model", CONFIG.anthropicModel); } catch(e){}
       showToast("Saved");
       navigate(state.screen, {replace:true});
-    }}, "Save"),
-    e("button",{class:"btn sm subtle",onClick: async ()=>{
-      if(!keyInput.value.trim()) return showToast("Enter a key first");
-      const prevKey = CONFIG.anthropicKey;
-      CONFIG.anthropicKey = keyInput.value.trim();
-      CONFIG.anthropicModel = modelSelect.value;
-      try {
-        showToast("Testing…");
-        const out = await callAnthropic("Reply with the single word: ok", { maxTokens: 10 });
-        if(out && out.toLowerCase().includes("ok")) showToast("✓ Key works");
-        else showToast("Got response, but unexpected: " + out.slice(0,40));
-      } catch(err){
-        showToast("Failed: " + (err.message || "unknown"));
-      } finally {
-        CONFIG.anthropicKey = prevKey; // don't persist on test
-      }
-    }}, "Test"),
-    e("button",{class:"btn sm subtle",onClick:()=>{
-      uiConfirm("Clear API key from this device?", ()=>{
-        CONFIG.anthropicKey = "";
-        keyInput.value = "";
-        try { localStorage.removeItem("recruit_anthropic_key"); } catch(e){}
-        showToast("Cleared — using mock");
-        navigate(state.screen, {replace:true});
-      }, { title:"Clear API key", okLabel:"Clear", danger:true });
-    }}, "Clear")
+    }}, "Save")
   ));
   wrap.appendChild(aiCard);
 
@@ -22893,6 +22707,10 @@ function viewReports(){
   kpiBand.appendChild(rkpi("Red", String(reds.length), "bad"));
   kpiBand.appendChild(rkpi("LOIs out", String(loi.length)));
   kpiBand.appendChild(rkpi("Hires YTD", String(hiresYTD.length), "good"));
+  // Outbound messages sent this month — texts, LinkedIn DMs, emails, and warm-outreach / What's Working Now sends.
+  const OUTBOUND_MSG_TYPES = ["text-sent","linkedin-sent","email-sent","outreach-sent"];
+  const msgsMTD = (state.activities || []).filter(a => a && OUTBOUND_MSG_TYPES.indexOf(a.type) !== -1 && a.ts >= monthStartTs).length;
+  kpiBand.appendChild(rkpi("Messages sent MTD", String(msgsMTD), "accent"));
   wrap.appendChild(kpiBand);
 
   // ===== EXEC SUMMARY (auto + editable note) =====
@@ -23720,28 +23538,30 @@ function renderCloudPill(pill){
     ? `Cloud: ${cloudStatus.state} — ${cloudStatus.lastError}`
     : `Cloud: ${cloudStatus.state}${cloudStatus.lastSyncAt ? " · last synced " + fmtDateTime(cloudStatus.lastSyncAt) : ""}`;
 }
-/* Cloud pill click: ask the sync engine to reconcile now — flush any local-only
-   records up to the master and re-confirm the live listener. The engine never
-   does a blob overwrite, so this is always safe. */
+/* Cloud pill click: PUSH-ONLY. Never pulls — pulling can overwrite local
+   changes and is the source class of bugs we fixed before. To grab edits
+   from another device, reload the page (boot-time sync compares timestamps
+   and pulls only if cloud is genuinely newer). */
 const _cloudPill = $("#cloud-pill");
 renderCloudPill(_cloudPill);
 _cloudPill.addEventListener("click", async () => {
-  const st = cloudStatus.state;
-  if((st === "error" || st === "noauth") && window._rosSync && typeof window._rosSync.diagnose === "function"){
-    window._rosSync.diagnose();
+  if(state.lastModified === 0){
+    showToast("Nothing local to sync");
+    setCloudStatus("synced");
     return;
   }
-  if(window._rosSync && typeof window._rosSync.reconcile === "function"){
-    try { await window._rosSync.reconcile({ manual: true }); }
-    catch(err){ if(window._rosSync.diagnose) window._rosSync.diagnose(); else showToast("Sync failed"); }
-    return;
+  setCloudStatus("syncing");
+  try {
+    await db.pushToCloud(stateToPersist());
+    showToast("Saved to cloud");
+  } catch(err){
+    setCloudStatus("error", err);
+    const msg = err && err.message ? err.message.slice(0, 100) : "unknown error";
+    showToast("Sync failed: " + msg);
   }
-  // Fallback if the engine hasn't attached yet (offline / SDK blocked).
-  showToast("Cloud not connected yet");
 });
 
-// Restore Anthropic key + model if user saved them
-try { const k = localStorage.getItem("recruit_anthropic_key");   if(k) CONFIG.anthropicKey = k; } catch(e){}
+// AI auth is handled by the Partners gateway — no per-user key to restore.
 try { const m = localStorage.getItem("recruit_anthropic_model"); if(m) CONFIG.anthropicModel = m; } catch(e){}
 
 loadState();
@@ -25293,589 +25113,224 @@ if(params.get("u") && params.get("pin")){
 </script>
 
 <!-- ============================================================
-     RECRUIT OS — SYNC ENGINE v2  (per-record · tombstoned · master-authoritative)
-     ------------------------------------------------------------
-     Replaces the old single-blob "last write wins" sync that let a
-     stale or empty tab overwrite the whole pipeline.
-
-     Goals this delivers:
-       • SINGLE SOURCE OF TRUTH — the cloud collections are the master.
-         Records live in the per-record collections already authorized in the
-         Firestore rules: prospects/{id}, activities/{id}, and campaigns/{id}
-         (the last holds org-config singletons). No rules change is needed.
-       • Each prospect / activity is its own document, so two people
-         editing different records can never clobber each other.
-       • LOGIN NEVER OVERWRITES THE MASTER. On boot we adopt the cloud
-         first; we only ever ADD local records the master has never seen.
-         There is no boot-time blob push.
-       • DELETES ARE TOMBSTONES — a delete propagates to everyone and a
-         stale client can't resurrect it. An empty local can't wipe master.
-       • Realtime: a teammate's change streams to every open app in ~1s.
-       • Offline edits stay local and flush as per-record writes on
-         reconnect — never as a blob.
-       • Auth is hardened: no infinite wait; "Not connected" is a loud,
-         distinct pill state so an island can't go unnoticed.
+     RECRUIT OS — LIVE CLOUD SYNC
+     The cloud document is the single source of truth. A realtime
+     listener pushes any teammate's change to every open app within
+     a second or two, and corrects a stale tab the moment it opens —
+     so no one can overwrite newer data with an old snapshot.
+     Updates are deferred while someone is mid-edit (modal open or a
+     field focused) so the screen never gets yanked out from under them.
      ============================================================ -->
 <script>
 (function(){
   "use strict";
 
-  /* ---- collections (project: recruiting-relationship-mgr) ----
-     These names match the per-record collections already pre-authorized in the
-     Firestore security rules, so this build needs NO rules change. Org-config
-     singletons live in `campaigns` (doc id = config key); `research` is left
-     free for the future RETR loan-officer data. */
-  var COL_P = "prospects";    // one doc per prospect,  id = prospect.id
-  var COL_A = "activities";   // one doc per activity,  id = activity.id
-  var COL_C = "campaigns";    // org-config singletons, doc id = config key (users, stages, …)
+  let started = false;
+  let firstSnap = true;
+  let pending = null;     // { cloud, cloudTime } waiting for the user to be idle
 
-  /* ---- engine state ---- */
-  var started = false, starting = false;
-  var adopted = false;        // prospects adopted from master?
-  var configAdopted = false;  // org-config adopted from master?
-  var actAdopted = false;     // activities adopted from master?
-  var applyingRemote = false; // guard so remote-apply never bounces back as a push
-
-  var lastSentP = {};   // prospect id  -> content hash we last wrote (echo guard)
-  var lastSentA = {};   // activity id  -> content hash
-  var lastSentC = {};   // config key   -> JSON of value
-  var knownCloudP = {}; // prospect id  -> { _rev, _deleted }  (what master holds)
-  var knownCloudA = {}; // activity id  -> { _rev, _deleted }
-
-  var flushTimer = null, flushing = false, flushAgain = false;
-  var renderPending = false;
-
-  var BAK_PREFIX = LS_KEY + ":bak:";
-
-  /* ---- small helpers ---- */
-  function recHash(o){
-    var c = Object.assign({}, o);
-    delete c._rev; delete c._deleted; delete c._deletedAt;
-    try { return JSON.stringify(c); } catch(e){ return String(Math.random()); }
-  }
-  function stripMeta(d){
-    var c = Object.assign({}, d);
-    delete c._rev; delete c._deleted; delete c._deletedAt;
-    return c;
-  }
-  function cacheLocal(){
-    try { localStorage.setItem(LS_KEY, JSON.stringify(stateToPersist())); } catch(e){}
-  }
-  function listBackups(){
-    var out = [];
-    try { for(var i=0;i<localStorage.length;i++){ var k=localStorage.key(i); if(k && k.indexOf(BAK_PREFIX)===0) out.push(k); } } catch(e){}
-    return out.sort();
-  }
-  function writeBackup(){
-    try {
-      if(!state.prospects || !state.prospects.some(function(p){ return p && !p._seed; })) return;
-      localStorage.setItem(BAK_PREFIX + Date.now(), JSON.stringify(stateToPersist()));
-      var b = listBackups();
-      while(b.length > 10){ localStorage.removeItem(b.shift()); }
-    } catch(e){}
-  }
   function isBusy(){
+    // A modal is open, an input is focused, or a full-screen builder is up.
     if(document.querySelector("#modal-bg.show, .modal-bg.show")) return true;
     if(document.body.classList.contains("wow-active") || document.body.classList.contains("proforma-active")) return true;
-    var ae = document.activeElement;
+    const ae = document.activeElement;
     if(ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)) return true;
     return false;
   }
-  function maybeRender(){
-    if(!state.user || typeof render !== "function") return;
-    if(isBusy()){ renderPending = true; return; }
-    try { render(); } catch(e){ console.warn("[sync] render", e); }
-  }
-  setInterval(function(){ if(renderPending && !isBusy()){ renderPending = false; maybeRender(); } }, 1200);
 
-  /* ---- batched writes (atomic per chunk) ---- */
-  async function commitOps(fb, ops){
-    for(var i=0;i<ops.length;i+=400){
-      var batch = fb.writeBatch(fb.fdb);
-      var chunk = ops.slice(i, i+400);
-      for(var j=0;j<chunk.length;j++){
-        batch.set(fb.doc(fb.fdb, chunk[j].col, chunk[j].id), chunk[j].data);
-      }
-      await batch.commit();
+  function applyCloudState(cloud, cloudTime){
+    var incoming = cloud.prospects || [];
+    var incomingReal = incoming.some(function(p){ return p && !p._seed; });
+    var localReal = state.prospects && state.prospects.some(function(p){ return p && !p._seed; });
+    // SAFETY: never let an empty OR sample-only cloud snapshot wipe a populated pipeline.
+    // If we hold real data and the cloud came back empty/sample-only, OUR copy is the
+    // good one — push it back up to repair the cloud and stop the wipe from spreading.
+    if(!incomingReal && localReal){
+      console.warn("[cloud] ignored an empty/sample-only prospects update — re-pushing local data to restore the cloud");
+      state.lastModified = Date.now();
+      try { db.pushToCloud(stateToPersist()); } catch(e){}
+      if(typeof setCloudStatus === "function") setCloudStatus("synced");
+      return;
     }
-  }
+    state.prospects        = incoming;
+    state.activities       = cloud.activities       || [];
+    state.users            = cloud.users            || (typeof USERS !== "undefined" ? USERS.slice() : state.users);
+    state.cadenceTemplates = cloud.cadenceTemplates || null;
+    state.videoLibrary     = cloud.videoLibrary     || [];
+    state.brandFacts       = (typeof cloud.brandFacts === "string") ? cloud.brandFacts : null;
+    if(typeof cloud.reportNote === "string") state.reportNote = cloud.reportNote;
+    if(cloud.stages && Array.isArray(cloud.stages) && cloud.stages.length) state.stages = cloud.stages;
+    if(cloud.contentLinks && typeof cloud.contentLinks === "object") state.contentLinks = cloud.contentLinks;
+    state.lastModified = cloudTime;
 
-  /* ---- pushes (per record, only what changed) ---- */
-  async function pushProspects(fb){
-    var live = (state.prospects||[]).filter(function(p){ return p && !p._seed; });
-    var liveIds = {}; live.forEach(function(p){ liveIds[String(p.id)] = true; });
-    var ops = [];
-    live.forEach(function(p){
-      var id = String(p.id), h = recHash(p);
-      if(lastSentP[id] === h) return;                 // unchanged → skip
-      var rev = Date.now();
-      ops.push({ col:COL_P, id:id, h:h, rev:rev,
-                 data: deepStripUndefined(Object.assign({}, p, { id:p.id, _rev:rev, _deleted:false })) });
-    });
-    Object.keys(knownCloudP).forEach(function(id){     // tombstone records removed locally
-      if(knownCloudP[id]._deleted) return;
-      if(liveIds[String(id)]) return;
-      var rev = Date.now();
-      ops.push({ col:COL_P, id:String(id), tomb:true, rev:rev,
-                 data:{ id:id, _deleted:true, _deletedAt:rev, _rev:rev } });
-    });
-    if(!ops.length) return;
-    await commitOps(fb, ops);
-    ops.forEach(function(op){
-      if(op.tomb){ knownCloudP[op.id] = { _rev:op.rev, _deleted:true }; delete lastSentP[op.id]; }
-      else { lastSentP[op.id] = op.h; knownCloudP[op.id] = { _rev:op.rev, _deleted:false }; }
-    });
-  }
+    if(typeof migrateProspectStages === "function") migrateProspectStages(state.prospects);
+    if(typeof ensureReportingFields === "function") state.prospects.forEach(ensureReportingFields);
 
-  async function pushActivities(fb){
-    var seed = {}; (state.prospects||[]).forEach(function(p){ if(p && p._seed) seed[String(p.id)] = true; });
-    var acts = (state.activities||[]).filter(function(a){ return a && a.id != null && a.prospectId != null && !seed[String(a.prospectId)]; });
-    var liveIds = {}; acts.forEach(function(a){ liveIds[String(a.id)] = true; });
-    var ops = [];
-    acts.forEach(function(a){
-      var id = String(a.id), h = recHash(a);
-      if(lastSentA[id] === h) return;
-      var rev = Date.now();
-      ops.push({ col:COL_A, id:id, h:h, rev:rev,
-                 data: deepStripUndefined(Object.assign({}, a, { id:a.id, _rev:rev, _deleted:false })) });
-    });
-    Object.keys(knownCloudA).forEach(function(id){
-      if(knownCloudA[id]._deleted) return;
-      if(liveIds[String(id)]) return;
-      var rev = Date.now();
-      ops.push({ col:COL_A, id:String(id), tomb:true, rev:rev,
-                 data:{ id:id, _deleted:true, _deletedAt:rev, _rev:rev } });
-    });
-    if(!ops.length) return;
-    await commitOps(fb, ops);
-    ops.forEach(function(op){
-      if(op.tomb){ knownCloudA[op.id] = { _rev:op.rev, _deleted:true }; delete lastSentA[op.id]; }
-      else { lastSentA[op.id] = op.h; knownCloudA[op.id] = { _rev:op.rev, _deleted:false }; }
-    });
-  }
-
-  async function pushConfig(fb){
-    var cfg = {
-      users:            state.users,
-      cadenceTemplates: state.cadenceTemplates,
-      videoLibrary:     state.videoLibrary,
-      brandFacts:       state.brandFacts,
-      reportNote:       state.reportNote,
-      stages:           state.stages || null
-    };
-    var ops = [];
-    Object.keys(cfg).forEach(function(key){
-      var val = (cfg[key] === undefined) ? null : cfg[key];
-      var j = JSON.stringify(val);
-      if(lastSentC[key] === j) return;
-      var rev = Date.now();
-      ops.push({ col:COL_C, id:key, key:key, j:j, data: deepStripUndefined({ value:val, _rev:rev }) });
-    });
-    if(!ops.length) return;
-    await commitOps(fb, ops);
-    ops.forEach(function(op){ lastSentC[op.key] = op.j; });
-  }
-
-  async function flushNow(){
-    var fb = window._fb;
-    if(!fb || !fb.user || !adopted) return;   // never push before adopting the master
-    if(flushing){ flushAgain = true; return; }
-    flushing = true;
-    try {
-      await pushProspects(fb);
-      await pushActivities(fb);
-      if(configAdopted) await pushConfig(fb);
-      setCloudStatus("live");
-      writeBackup();
-    } catch(err){
-      noteError("flush", err);
-    } finally {
-      flushing = false;
-      if(flushAgain){ flushAgain = false; scheduleFlush(); }
-    }
-  }
-  function scheduleFlush(){
-    if(flushTimer) clearTimeout(flushTimer);
-    flushTimer = setTimeout(function(){ flushTimer = null; flushNow(); }, 300);
-  }
-
-  /* ---- legacy migration: pull real prospects out of the old meta/state blob ---- */
-  async function readLegacyBlobReal(){
-    try {
-      var fb = window._fb; if(!fb) return [];
-      var ref = fb.doc.apply(null, [fb.fdb].concat(FS_DOC_PATH));
-      var snap = await fb.getDoc(ref);
-      if(!snap.exists()) return [];
-      var d = snap.data() || {};
-      return (d.prospects || []).filter(function(p){ return p && !p._seed; });
-    } catch(e){ return []; }
-  }
-
-  /* ---- adoption (first snapshot per collection) ---- */
-  async function adoptProspects(rows){
-    var tagSeed = (typeof markSeedIfSample === "function") ? markSeedIfSample : function(p){ return p; };
-    var cloudLive = rows.filter(function(d){ return d && d.id != null && !d._deleted; })
-                        .map(stripMeta).map(tagSeed)
-                        .filter(function(p){ return !p._seed; });   // never adopt sample rows into the board
-    var cloudIds = {}; cloudLive.forEach(function(p){ cloudIds[String(p.id)] = true; });
-    var tomb = {}; rows.forEach(function(d){ if(d && d._deleted && d.id != null) tomb[String(d.id)] = true; });
-    var localReal = (state.prospects||[]).map(tagSeed).filter(function(p){ return p && !p._seed; });
-
-    if(cloudLive.length === 0 && Object.keys(tomb).length === 0){
-      // Master is empty → we seed it from real local data (+ any real data still
-      // sitting in the old blob). This is additive, not an overwrite.
-      var migrate = localReal.slice();
-      var blobReal = await readLegacyBlobReal();
-      blobReal.forEach(function(bp){ if(!migrate.some(function(x){ return x.id === bp.id; })) migrate.push(bp); });
-      state.prospects = migrate;
-      migrate.forEach(ensureReportingFields);
-      adopted = true;
-      await flushNow();   // pushes the migrated set up as the new master
-    } else {
-      // Master has data → it wins. We adopt it, and ADD only local records the
-      // master has never heard of (not live, not tombstoned). Nothing is overwritten.
-      var merged = cloudLive.slice();
-      var localOnly = localReal.filter(function(p){ return !cloudIds[String(p.id)] && !tomb[String(p.id)]; });
-      localOnly.forEach(function(p){ merged.push(p); });
-      state.prospects = merged;
-      merged.forEach(ensureReportingFields);
-      migrateProspectStages(state.prospects);
-      cloudLive.forEach(function(p){ lastSentP[String(p.id)] = recHash(p); }); // already in sync → don't re-push
-      adopted = true;
-      await flushNow();   // pushes ONLY localOnly additions (safe — additive)
-    }
-    cacheLocal();
-    setCloudStatus("live");
-    maybeRender();
-  }
-
-  function applyConfigKey(key, doc){
-    var v = (doc && Object.prototype.hasOwnProperty.call(doc, "value")) ? doc.value : null;
-    if(key === "users"){
-      state.users = v || (typeof USERS !== "undefined" ? USERS.slice() : state.users);
-      if(typeof reconcileUsersWithCode === "function") reconcileUsersWithCode();   // code roles win over stale cloud
-    }
-    else if(key === "cadenceTemplates") state.cadenceTemplates = v || null;
-    else if(key === "videoLibrary")     state.videoLibrary = v || [];
-    else if(key === "brandFacts")       state.brandFacts = (typeof v === "string") ? v : null;
-    else if(key === "reportNote")       state.reportNote = (typeof v === "string") ? v : "";
-    else if(key === "stages")           state.stages = (v && Array.isArray(v) && v.length) ? v : null;
-    if(key === "users" && state.user){
-      var me = state.users.find(function(u){ return u.id === state.user.id; });
+    // Re-point the currently open user object at the refreshed users array so
+    // role/name stay correct after a remote update.
+    if(state.user){
+      const me = state.users.find(u => u.id === state.user.id);
       if(me) state.user = me;
     }
+
+    try { localStorage.setItem(LS_KEY, JSON.stringify(stateToPersist())); } catch(e){}
+    if(state.user && typeof render === "function") render();
+    if(typeof setCloudStatus === "function") setCloudStatus("synced");
   }
 
-  /* ---- snapshot handlers ---- */
-  function prospectSnap(qs){
-    var rows = [];
-    qs.forEach(function(ds){ var data = ds.data() || {}; if(data.id == null) data.id = ds.id; rows.push(data); });
-    rows.forEach(function(d){ if(d.id != null) knownCloudP[String(d.id)] = { _rev:d._rev||0, _deleted:!!d._deleted }; });
-
-    if(!adopted){ adoptProspects(rows); return; }
-
-    applyingRemote = true;
-    var changed = false, tellTeam = false;
-    rows.forEach(function(d){
-      if(d.id == null) return;
-      var id = d.id;
-      var idx = state.prospects.findIndex(function(p){ return p && p.id === id; });
-      if(d._deleted){
-        if(idx >= 0){
-          state.prospects.splice(idx, 1);
-          state.activities = state.activities.filter(function(a){ return a.prospectId !== id; });
-          delete lastSentP[String(id)];
-          changed = true; tellTeam = true;
-        }
-        return;
-      }
-      var inc = stripMeta(d); ensureReportingFields(inc);
-      if(typeof markSeedIfSample === "function") markSeedIfSample(inc);
-      if(inc._seed){
-        // A built-in sample record reached the cloud (from an older build).
-        // Never show it; drop it locally if present and don't track it.
-        if(idx >= 0){ state.prospects.splice(idx, 1); changed = true; }
-        delete lastSentP[String(id)];
-        return;
-      }
-      if(idx >= 0){
-        if(recHash(state.prospects[idx]) === recHash(inc)){ lastSentP[String(id)] = recHash(inc); return; } // echo / no change
-        state.prospects[idx] = inc;
-      } else {
-        state.prospects.push(inc);
-      }
-      lastSentP[String(id)] = recHash(inc);
-      changed = true; tellTeam = true;
-    });
-    applyingRemote = false;
-    if(changed){
-      migrateProspectStages(state.prospects);
-      cacheLocal();
-      maybeRender();
-      if(tellTeam && state.user && typeof showToast === "function") showToast("Updated from a teammate");
+  function maybeApply(cloud, cloudTime){
+    if(isBusy()){ pending = { cloud: cloud, cloudTime: cloudTime }; return; }
+    const wasFirst = firstSnap;
+    applyCloudState(cloud, cloudTime);
+    if(!wasFirst && state.user && typeof showToast === "function"){
+      showToast("Updated from another teammate");
     }
   }
 
-  function actSnap(qs){
-    var rows = [];
-    qs.forEach(function(ds){ var data = ds.data() || {}; if(data.id == null) data.id = ds.id; rows.push(data); });
-    rows.forEach(function(d){ if(d.id != null) knownCloudA[String(d.id)] = { _rev:d._rev||0, _deleted:!!d._deleted }; });
-
-    if(!actAdopted){
-      applyingRemote = true;
-      var byId = {};
-      (state.activities||[]).forEach(function(a){ if(a && a.id != null) byId[String(a.id)] = a; });
-      rows.filter(function(d){ return d.id != null && !d._deleted; }).forEach(function(d){
-        var a = stripMeta(d); byId[String(a.id)] = a; lastSentA[String(a.id)] = recHash(a);
-      });
-      rows.filter(function(d){ return d.id != null && d._deleted; }).forEach(function(d){ delete byId[String(d.id)]; });
-      state.activities = Object.keys(byId).map(function(k){ return byId[k]; });
-      applyingRemote = false;
-      actAdopted = true;
-      cacheLocal(); maybeRender();
-      return;
+  // Flush a deferred update once the user stops editing.
+  setInterval(function(){
+    if(pending && !isBusy()){
+      const p = pending; pending = null;
+      maybeApply(p.cloud, p.cloudTime);
     }
+  }, 500);
 
-    applyingRemote = true;
-    var changed = false;
-    rows.forEach(function(d){
-      if(d.id == null) return;
-      var idx = state.activities.findIndex(function(a){ return a && a.id === d.id; });
-      if(d._deleted){ if(idx >= 0){ state.activities.splice(idx, 1); changed = true; } return; }
-      var inc = stripMeta(d);
-      if(idx >= 0){
-        if(recHash(state.activities[idx]) === recHash(inc)){ lastSentA[String(d.id)] = recHash(inc); return; }
-        state.activities[idx] = inc;
-      } else {
-        state.activities.push(inc);
-      }
-      lastSentA[String(d.id)] = recHash(inc);
-      changed = true;
-    });
-    applyingRemote = false;
-    if(changed){ cacheLocal(); maybeRender(); }
-  }
-
-  function configSnap(qs){
-    var incoming = {};
-    qs.forEach(function(ds){ incoming[ds.id] = ds.data() || {}; });
-    var keys = Object.keys(incoming);
-
-    if(!configAdopted){
-      if(keys.length === 0){
-        // Master has no config yet → local becomes the seed; push it up.
-        configAdopted = true;
-        scheduleFlush();
-        return;
-      }
-      applyingRemote = true;
-      keys.forEach(function(k){
-        applyConfigKey(k, incoming[k]);
-        lastSentC[k] = JSON.stringify((incoming[k] && incoming[k].value !== undefined) ? incoming[k].value : null);
-      });
-      applyingRemote = false;
-      configAdopted = true;
-      cacheLocal(); maybeRender();
-      return;
-    }
-
-    applyingRemote = true;
-    var changed = false;
-    keys.forEach(function(k){
-      var val = (incoming[k] && incoming[k].value !== undefined) ? incoming[k].value : null;
-      var j = JSON.stringify(val);
-      if(lastSentC[k] === j) return;
-      applyConfigKey(k, incoming[k]);
-      lastSentC[k] = j; changed = true;
-    });
-    applyingRemote = false;
-    if(changed){ cacheLocal(); maybeRender(); }
-  }
-
-  /* ---- auth wait with timeout (no more infinite hang) ---- */
-  function waitAuth(fb, ms){
-    if(fb.user) return Promise.resolve(true);
-    return new Promise(function(resolve){
-      var done = false;
-      function fin(v){ if(!done){ done = true; resolve(v); } }
-      window.addEventListener("firebase-auth-ready",  function(){ fin(true); },  { once:true });
-      window.addEventListener("firebase-auth-failed", function(){ fin(false); }, { once:true });
-      setTimeout(function(){ fin(!!fb.user); }, ms);
-    });
-  }
-
-  /* ---- start: pull-first, never a blob push ---- */
-  async function start(){
-    if(started || starting) return;
-    starting = true;
+  async function startLiveSync(){
+    if(started) return;
+    const fb = await window._fbReady;
+    if(!fb || !fb.onSnapshot){ return; }            // offline / SDK blocked → stays on boot+manual sync
+    if(!fb.user){ try { await new Promise(res => window.addEventListener("firebase-auth-ready", res, { once:true })); } catch(e){} }
+    started = true;
     try {
-      var fb = await window._fbReady;
-      if(!fb || !fb.onSnapshot || !fb.collection){ setCloudStatus("offline"); return; }
-      setCloudStatus("syncing");
-      var ok = await waitAuth(fb, 8000);
-      if(!ok || !fb.user){
-        cloudStatus.lastError = "Sign-in blocked — confirm you opened the shared https link (not a downloaded file), and that this URL is an Authorized domain in Firebase.";
-        setCloudStatus("noauth");
-        return;
-      }
-      unsubs.forEach(function(u){ try { u && u(); } catch(_){} }); unsubs = [];
-      adopted = false; configAdopted = false; actAdopted = false;
-      unsubs.push(fb.onSnapshot(fb.collection(fb.fdb, COL_C), configSnap,   function(e){ noteError("config listener", e); }));
-      unsubs.push(fb.onSnapshot(fb.collection(fb.fdb, COL_A), actSnap,      function(e){ noteError("activity listener", e); }));
-      unsubs.push(fb.onSnapshot(fb.collection(fb.fdb, COL_P), prospectSnap, function(e){ noteError("prospect listener", e); }));
-      started = true;
-      setCloudStatus("live");
-      console.log("[sync] per-record live sync active");
-    } catch(err){
-      noteError("start", err);
-    } finally {
-      starting = false;
-    }
-  }
-
-  async function reconcile(opts){
-    var fb = await window._fbReady;
-    if(!fb){ setCloudStatus("offline"); return; }
-    if(!started){ await start(); }
-    await flushNow();
-    if(opts && opts.manual && state.user && typeof showToast === "function") showToast("Synced with the team");
-  }
-
-  /* ---- in-app diagnostics (so a failure is readable without a console) ---- */
-  var unsubs = [];
-  var _lastDiag = null;
-  var _lastErrToast = 0;
-  function noteError(where, err){
-    var code = (err && err.code) ? String(err.code) : "";
-    var raw  = (err && err.message) ? err.message : String(err);
-    _lastDiag = { where: where, code: code, raw: raw, at: Date.now() };
-    cloudStatus.lastError = friendlyError(code, raw);
-    setCloudStatus("error");
-    try { console.warn("[sync] " + where, err); } catch(_){}
-    var now = Date.now();
-    if(now - _lastErrToast > 8000 && typeof showToast === "function"){
-      _lastErrToast = now;
-      showToast("Cloud error — tap the status pill for details");
-    }
-  }
-  function friendlyError(code, raw){
-    var r = (raw || "").toLowerCase();
-    if(code === "permission-denied" || r.indexOf("permission") >= 0 || r.indexOf("insufficient") >= 0)
-      return "The cloud rejected the team collections (permission-denied). The Firestore security rules don't allow the new collections yet — tap the pill for the rules to paste.";
-    if(code === "unavailable" || code === "deadline-exceeded" || r.indexOf("network") >= 0 || r.indexOf("offline") >= 0)
-      return "Couldn't reach the cloud right now (network). Tap the pill to retry.";
-    if(code === "unauthenticated")
-      return "Sign-in expired. Reload the page to reconnect.";
-    if(code === "failed-precondition")
-      return "Firestore setup issue (failed-precondition). The database may not be fully enabled for this project.";
-    if(r.indexOf("is not a function") >= 0 || (r.indexOf("collection") >= 0 && r.indexOf("undefined") >= 0))
-      return "This copy is missing the newest sync code. Re-upload the latest RecruitOS.html and hard-refresh.";
-    return raw || "Unknown cloud error.";
-  }
-  function showDiagnostics(){
-    if(typeof showModal !== "function" || typeof e !== "function"){
-      if(typeof showToast === "function") showToast(cloudStatus.lastError || "Cloud error");
-      return;
-    }
-    showModal("Cloud connection", function(m, close){
-      var st = cloudStatus.state;
-      var head = (st === "noauth") ? "Not connected \u2014 sign-in was blocked."
-               : (st === "error")  ? "Cloud error \u2014 the sync engine hit a problem."
-               : (st === "live" || st === "synced") ? "Connected and live."
-               : ("Status: " + st);
-      m.appendChild(e("p", { style:"margin:0 0 10px;font-weight:600;" }, head));
-      if(cloudStatus.lastError)
-        m.appendChild(e("p", { style:"margin:0 0 10px;color:#475569;line-height:1.45;" }, cloudStatus.lastError));
-
-      var permLike = (st === "error") || (_lastDiag && (_lastDiag.code === "permission-denied" || (_lastDiag.raw || "").toLowerCase().indexOf("permission") >= 0));
-      if(permLike){
-        m.appendChild(e("p", { style:"margin:14px 0 6px;font-weight:600;" }, "Most likely fix \u2014 Firestore rules"));
-        m.appendChild(e("p", { style:"margin:0 0 6px;color:#475569;line-height:1.45;" },
-          "In the Firebase console for project recruiting-relationship-mgr: Firestore Database \u2192 Rules. Allow signed-in users to read/write the team collections, then Publish:"));
-        var rules =
-          "rules_version = '2';\n" +
-          "service cloud.firestore {\n" +
-          "  match /databases/{database}/documents {\n" +
-          "    match /meta/state      { allow read, write: if request.auth != null; }\n" +
-          "    match /prospects/{id}  { allow read, write: if request.auth != null; }\n" +
-          "    match /activities/{id} { allow read, write: if request.auth != null; }\n" +
-          "    match /campaigns/{id}  { allow read, write: if request.auth != null; }\n" +
-          "    match /{document=**}   { allow read, write: if false; }\n" +
-          "  }\n" +
-          "}";
-        var ta = e("textarea", { readonly:"readonly", style:"width:100%;height:172px;box-sizing:border-box;font-family:ui-monospace,Menlo,monospace;font-size:12px;border:1px solid #cbd5e1;border-radius:8px;padding:10px;white-space:pre;" });
-        ta.value = rules;
-        m.appendChild(ta);
-        var copyBtn = e("button", { style:"margin-top:8px;padding:7px 13px;border-radius:8px;border:1px solid #cbd5e1;background:#fff;cursor:pointer;font-weight:600;" }, "Copy rules");
-        copyBtn.addEventListener("click", function(){
-          try { ta.focus(); ta.select(); } catch(_){}
-          if(navigator.clipboard && navigator.clipboard.writeText){
-            navigator.clipboard.writeText(rules).then(function(){ if(typeof showToast === "function") showToast("Rules copied"); }, function(){});
-          } else {
-            try { document.execCommand("copy"); if(typeof showToast === "function") showToast("Rules copied"); } catch(_){}
-          }
-        });
-        m.appendChild(copyBtn);
-      }
-      if(_lastDiag){
-        m.appendChild(e("p", { style:"margin:14px 0 4px;font-size:12px;color:#94a3b8;" },
-          "Detail: " + (_lastDiag.where || "") + (_lastDiag.code ? (" \u2014 " + _lastDiag.code) : "")));
-      }
-      var row = e("div", { style:"display:flex;gap:8px;margin-top:16px;" });
-      var retry = e("button", { style:"padding:8px 14px;border-radius:8px;border:none;background:#00818D;color:#fff;cursor:pointer;font-weight:600;" }, "Retry now");
-      retry.addEventListener("click", function(){
-        close();
-        if(typeof showToast === "function") showToast("Reconnecting\u2026");
-        started = false; starting = false;
-        start();
+      const ref = fb.doc(fb.fdb, ...FS_DOC_PATH);
+      fb.onSnapshot(ref, function(snap){
+        if(!snap || !snap.exists || !snap.exists()) { firstSnap = false; return; }
+        const cloud = snap.data() || {};
+        const cloudTime = cloud.lastModified || cloud._updatedAt || 0;
+        // Only apply when the cloud is genuinely newer than what we hold.
+        // Our own writes echo back with cloudTime === state.lastModified and are skipped,
+        // so there's no feedback loop.
+        if(cloudTime > (state.lastModified || 0)){
+          maybeApply(cloud, cloudTime);
+        }
+        firstSnap = false;
+      }, function(err){
+        console.warn("[cloud] live sync listener error", err);
       });
-      var done = e("button", { style:"padding:8px 14px;border-radius:8px;border:1px solid #cbd5e1;background:#fff;cursor:pointer;" }, "Close");
-      done.addEventListener("click", function(){ close(); });
-      row.appendChild(retry); row.appendChild(done);
-      m.appendChild(row);
-    });
+      console.log("[cloud] live sync active");
+    } catch(err){
+      console.warn("[cloud] could not start live sync", err);
+      started = false;
+    }
   }
 
-  /* ---- wire overrides ---- */
-  // Every local save flows through persist() → db.set() → db.pushToCloud().
-  // `db` is a top-level lexical const, NOT a window property, so reference it by
-  // name. (The old guard checked window.db, which is undefined, so this hook
-  // never installed — that is why saves only synced on a manual pill press.)
-  // With the hook in place, every save auto-flushes per record = live, no button.
-  try {
-    db.pushToCloud = function(){ scheduleFlush(); return Promise.resolve(); };
-  } catch(e){ console.warn("[sync] could not hook db.pushToCloud", e); }
-  // Boot calls syncFromCloudOnBoot() once Firebase is ready — point it at start().
-  window.syncFromCloudOnBoot = start;
+  // Start after the existing boot sync has had a chance to run.
+  window._fbReady.then(function(fb){ if(fb) setTimeout(startLiveSync, 400); });
+})();
+</script>
 
-  // Friendlier pill: "Live" (green) and a loud "Not connected" (red) state.
-  if(typeof window.renderCloudPill === "function"){
-    window.renderCloudPill = function(pill){
-      if(!pill) return;
-      var styleMap = { live:"synced", noauth:"error", connecting:"syncing", init:"syncing" };
-      pill.dataset.status = styleMap[cloudStatus.state] || cloudStatus.state;
-      var labels = { init:"Connecting…", connecting:"Connecting…", syncing:"Syncing…", live:"Live", synced:"Live", offline:"Offline", noauth:"Not connected", error:"Cloud error" };
-      var lab = pill.querySelector(".cloud-label");
-      if(lab) lab.textContent = labels[cloudStatus.state] || "Cloud";
-      var when = cloudStatus.lastSyncAt ? (" · last synced " + (typeof fmtDateTime === "function" ? fmtDateTime(cloudStatus.lastSyncAt) : new Date(cloudStatus.lastSyncAt).toLocaleString())) : "";
-      pill.title = cloudStatus.lastError ? ("Cloud: " + cloudStatus.state + " — " + cloudStatus.lastError)
-                                         : ("Cloud: " + cloudStatus.state + when);
+<!-- ============================================================
+     RECRUIT OS — DATA SAFETY NET
+     · A push that would replace real cloud data with an empty
+       prospect list is blocked, and the cloud is pulled back instead.
+     · Every save also writes a timestamped local backup (last 10).
+     · On boot, if we somehow end up with an empty pipeline but a
+       backup holds data, we restore it and push it back up.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+  const BAK_PREFIX = LS_KEY + ":bak:";
+
+  function listBackups(){
+    const out = [];
+    try {
+      for(let i=0;i<localStorage.length;i++){
+        const k = localStorage.key(i);
+        if(k && k.indexOf(BAK_PREFIX) === 0) out.push(k);
+      }
+    } catch(e){}
+    return out.sort(); // chronological (keys end in timestamp)
+  }
+  function writeBackup(){
+    try {
+      if(!state.prospects || !state.prospects.some(function(p){ return p && !p._seed; })) return;   // only back up real data
+      localStorage.setItem(BAK_PREFIX + Date.now(), JSON.stringify(stateToPersist()));
+      const baks = listBackups();
+      while(baks.length > 10){ localStorage.removeItem(baks.shift()); }
+    } catch(e){}
+  }
+  function newestNonEmptyBackup(){
+    const baks = listBackups();
+    for(let i=baks.length-1;i>=0;i--){
+      try {
+        const d = JSON.parse(localStorage.getItem(baks[i]));
+        if(d && d.prospects && d.prospects.some(function(p){ return p && !p._seed; })) return d;
+      } catch(e){}
+    }
+    return null;
+  }
+
+  // Back up on every save.
+  if(typeof window.persist === "function"){
+    const _origPersist = window.persist;
+    window.persist = function(){ _origPersist.apply(this, arguments); writeBackup(); };
+  }
+
+  // Block any push that would wipe the cloud's real data with an empty / sample-only list.
+  if(window.db && typeof db.pushToCloud === "function"){
+    const _origPush = db.pushToCloud.bind(db);
+    db.pushToCloud = async function(snapshot){
+      try {
+        const pushReal = snapshot && snapshot.prospects && snapshot.prospects.some(function(p){ return p && !p._seed; });
+        if(!pushReal){
+          const cloud = await db.pullFromCloud();
+          if(cloud && cloud.prospects && cloud.prospects.some(function(p){ return p && !p._seed; })){
+            console.warn("[safety] blocked a push of empty/sample-only prospects over real cloud data — restoring from cloud");
+            state.prospects        = cloud.prospects;
+            state.activities       = cloud.activities       || state.activities;
+            state.users            = cloud.users            || state.users;
+            state.cadenceTemplates = cloud.cadenceTemplates || state.cadenceTemplates;
+            state.videoLibrary     = cloud.videoLibrary     || state.videoLibrary;
+            state.lastModified     = cloud.lastModified || cloud._updatedAt || Date.now();
+            if(state.user){ const me = state.users.find(u=>u.id===state.user.id); if(me) state.user = me; }
+            try { localStorage.setItem(LS_KEY, JSON.stringify(stateToPersist())); } catch(e){}
+            if(state.user && typeof render === "function") render();
+            if(typeof setCloudStatus === "function") setCloudStatus("synced");
+            return; // do NOT push the empty snapshot
+          }
+        }
+      } catch(e){ console.warn("[safety] push guard error", e); }
+      return _origPush(snapshot);
     };
-    var _pill = document.getElementById("cloud-pill");
-    if(_pill) window.renderCloudPill(_pill);
   }
 
-  // Public handle (used by the cloud-pill click and for manual reconcile).
-  window._rosSync = { start:start, reconcile:reconcile, flush:flushNow, diagnose:showDiagnostics, status:function(){ return cloudStatus.state; } };
+  // Auto-heal: shortly after boot, if the pipeline is empty but a backup has data,
+  // restore the newest non-empty backup and push it back up.
+  window._fbReady.then(function(){
+    setTimeout(function(){
+      try {
+        if(state.prospects && state.prospects.some(function(p){ return p && !p._seed; })) return;  // already have real data
+        const bak = newestNonEmptyBackup();
+        if(!bak) return;
+        console.warn("[safety] empty/sample-only pipeline on boot — restoring " + bak.prospects.length + " prospects from local backup");
+        state.prospects        = bak.prospects;
+        state.activities       = bak.activities       || [];
+        state.users            = bak.users            || state.users;
+        state.cadenceTemplates = bak.cadenceTemplates || state.cadenceTemplates;
+        state.videoLibrary     = bak.videoLibrary     || [];
+        state.lastModified     = Date.now();
+        if(state.user){ const me = state.users.find(u=>u.id===state.user.id); if(me) state.user = me; }
+        try { localStorage.setItem(LS_KEY, JSON.stringify(stateToPersist())); } catch(e){}
+        if(typeof db !== "undefined" && db.pushToCloud) db.pushToCloud(stateToPersist());
+        if(state.user && typeof render === "function") render();
+        if(typeof showToast === "function" && state.user) showToast("Recovered " + bak.prospects.length + " prospects from backup");
+      } catch(e){ console.warn("[safety] auto-heal error", e); }
+    }, 2500);
+  });
 
-  // Keep live sync resilient with no manual press: attach listeners the instant
-  // auth lands (covers a slow cold start where the boot attempt ran too early),
-  // and re-flush / re-arm when the network comes back.
-  window.addEventListener("firebase-auth-ready", function(){ start(); });
-  window.addEventListener("online", function(){ if(!started){ start(); } else { scheduleFlush(); } });
-
-  // Back up immediately if real data is already loaded.
-  try { if(state.prospects && state.prospects.some(function(p){ return p && !p._seed; })) writeBackup(); } catch(e){}
+  // Write one backup now if we already have data loaded.
+  try { if(state.prospects && state.prospects.length) writeBackup(); } catch(e){}
 })();
 </script>
 
@@ -25900,5 +25355,939 @@ if(params.get("u") && params.get("pin")){
   }
 })();
 </script>
+
+<!-- ============================================================
+     RECRUIT OS — EXPORT / IMPORT (Settings)
+     A reliable, cloud-independent way to move the whole pipeline
+     between machines or set the master copy. Export downloads the
+     full state as JSON; Import loads a file, makes it the master,
+     and pushes it to the cloud.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+
+  function exportAll(){
+    try { if(state.prospects) state.prospects.forEach(function(p){ if(p) delete p._seed; }); } catch(e){}
+    const snap = stateToPersist(); snap.lastModified = Date.now();
+    const blob = new Blob([JSON.stringify(snap)], { type:"application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "recruitos-backup-" + new Date().toISOString().slice(0,10) + ".json";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(function(){ URL.revokeObjectURL(a.href); }, 1500);
+    if(typeof showToast === "function") showToast("Exported " + ((snap.prospects&&snap.prospects.length)||0) + " prospects");
+  }
+
+  function importAll(){
+    const inp = document.createElement("input");
+    inp.type = "file"; inp.accept = "application/json,.json";
+    inp.onchange = function(){
+      const f = inp.files && inp.files[0]; if(!f) return;
+      f.text().then(function(text){
+        let data; try { data = JSON.parse(text); } catch(e){ showToast("Could not read that file"); return; }
+        if(!data || !data.prospects || !data.prospects.length){ showToast("That file has no prospects"); return; }
+        uiConfirm("Import " + data.prospects.length + " prospects from this file? This becomes the master copy for everyone and pushes to the cloud.", async function(){
+          state.prospects        = data.prospects.map(function(p){ if(p) delete p._seed; return p; });
+          state.activities       = data.activities       || state.activities;
+          state.users            = data.users            || state.users;
+          state.cadenceTemplates = data.cadenceTemplates || state.cadenceTemplates;
+          state.videoLibrary     = data.videoLibrary     || state.videoLibrary;
+          if(data.stages && data.stages.length) state.stages = data.stages;
+          if(typeof data.brandFacts === "string") state.brandFacts = data.brandFacts;
+          if(typeof data.reportNote === "string") state.reportNote = data.reportNote;
+          state.lastModified = Date.now();
+          if(state.user){ const me = state.users.find(function(u){ return u.id === state.user.id; }); if(me) state.user = me; }
+          try { localStorage.setItem(LS_KEY, JSON.stringify(stateToPersist())); } catch(e){}
+          try {
+            if(window.db && db.pushToCloud){ await db.pushToCloud(stateToPersist()); showToast("Imported " + state.prospects.length + " and pushed to cloud"); }
+            else { showToast("Imported " + state.prospects.length + " (offline — will sync when online)"); }
+          } catch(e){ showToast("Imported locally — cloud push failed, will retry when online"); }
+          if(typeof render === "function") render();
+        }, { title:"Import data", okLabel:"Import" });
+      });
+    };
+    inp.click();
+  }
+
+  if(typeof window.viewSettings === "function"){
+    const _origViewSettings = window.viewSettings;
+    window.viewSettings = function(){
+      const node = _origViewSettings.apply(this, arguments);
+      try {
+        const card = e("div",{class:"card",style:"margin-top:12px"});
+        card.appendChild(e("h3",{style:"margin:0 0 8px;font-size:14px"},"Backup & transfer"));
+        card.appendChild(e("p",{class:"muted",style:"font-size:12.5px;margin:0 0 10px;line-height:1.5"},
+          "Export the whole pipeline to a file you can keep or move to another machine. Import a file to load it everywhere — it becomes the master copy and pushes to the cloud."));
+        const row = e("div",{style:"display:flex;gap:8px;flex-wrap:wrap"});
+        row.appendChild(e("button",{class:"btn sm",onClick:exportAll}, "Export all data"));
+        row.appendChild(e("button",{class:"btn ghost sm",onClick:importAll}, "Import from file"));
+        card.appendChild(row);
+        node.appendChild(card);
+      } catch(err){ console.error("export/import card failed", err); }
+      return node;
+    };
+  }
+
+  window.rosExportAll = exportAll;
+  window.rosImportAll = importAll;
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — CADENCE UX REWORK
+     · "What to Work on Now" = only touches ready to send today
+       (no engagement / recruitability scores).
+     · A clear "Mark done" button completes a touch without needing
+       a reply yet.
+     · A persistent reply box lives under the touch — paste the reply
+       whenever it arrives and the next move is planned from it.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+
+  /* ---- which prospects have a touch ready to send right now ---- */
+  function touchReadyNow(p){
+    if(!p || !p.cadence || !p.cadence.startedAt || p.cadence.paused) return null;
+    if(p.stage === "closed") return null;
+    if(window.isDNC && isDNC(p)) return null;
+    try { ensureChain(p); } catch(e){ return null; }
+    var t = currentTask(p);
+    if(!t) return null;
+    if(t.status === "active" || (t.unlockAt && t.unlockAt <= Date.now())) return t;
+    return null;
+  }
+  window.touchReadyNow = touchReadyNow;
+
+  // Accurate dashboard counts — derived from the SAME "ready now" logic as the
+  // What to Work on Now list, so the home-page top numbers match the list below.
+  function dueCounts(prospects){
+    var sod = new Date(); sod.setHours(0,0,0,0); var s = sod.getTime();
+    var today = 0, overdue = 0;
+    mainReady(prospects).forEach(function(x){
+      var t = x.t;
+      if(t && t.unlockAt && t.unlockAt < s) overdue++; else today++;
+    });
+    return { today: today, overdue: overdue, total: today + overdue };
+  }
+  window.dueCounts = dueCounts;
+
+  // Stages that belong in the active recruiting cadence list.
+  var ACTIVE_CADENCE_STAGES = ["new","engaged","deep","nurture"];
+  // Stages where everyone gets a daily keep-warm touch, shown in their own section.
+  var KEEPWARM_STAGES = ["loi"];
+
+  function myProspectsList(){
+    return state.prospects.filter(function(p){
+      return state.user.role === "admin" || state.user.role === "viewer" || p.assignedTo === state.user.id;
+    });
+  }
+
+  // Active-cadence touches that are due/overdue right now (excludes LOI, closed, etc.)
+  function mainReady(prospects){
+    var out = [];
+    (prospects || []).forEach(function(p){
+      if(ACTIVE_CADENCE_STAGES.indexOf(p.stage) === -1) return;
+      if(hasCallScheduled(p)) return;                 // call booked → they live on the closing checklist now
+      var t = touchReadyNow(p);
+      if(t) out.push({ p:p, t:t });
+    });
+    out.sort(function(a,b){ return (b.p.createdAt||0) - (a.p.createdAt||0); }); // newest first
+    return out;
+  }
+
+  // Everyone sitting in a given keep-warm stage (daily touch), not do-not-contact.
+  function keepWarmGroup(prospects, stageId){
+    var out = [];
+    (prospects || []).forEach(function(p){
+      if(p.stage !== stageId) return;
+      if(window.isDNC && isDNC(p)) return;
+      out.push(p);
+    });
+    out.sort(function(a,b){ return (b.p&&0) || ((b.createdAt||0) - (a.createdAt||0)); });
+    return out;
+  }
+
+  function workRow(p, t){
+    var ch = CHANNELS[t.channel] || {};
+    return e("button",{class:"intel-row",onClick:function(){ navigate("prospect:"+p.id); }},
+      e("div",{class:"intel-rank"}, htmlNode(channelIconSvg(t.channel || "sms"))),
+      e("div",{class:"intel-main"},
+        e("div",{class:"intel-name"}, (p.firstName+" "+p.lastName).trim(), p.company ? e("span",{class:"intel-co"}, " · "+p.company) : null),
+        e("div",{class:"intel-reason"}, (ch.label || t.channel || "Touch") + " · " + (t.action || "Send the next touch"))
+      )
+    );
+  }
+
+  var flameIcon = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 14.5A4 4 0 0 0 12 20a4 4 0 0 0 4-4c0-2-1-3-1-3s-.5 1.5-2 1.5c0 0 1-2.5-1-5.5 0 0-.5 3-3 4.5-1 .7-1.5 1.9-.5 3z"/><path d="M12 2s3 3 3 6a3 3 0 0 1-6 0c0-1 .5-2 1-3"/></svg>';
+  function keepWarmRow(p){
+    return e("button",{class:"intel-row",onClick:function(){ navigate("prospect:"+p.id); }},
+      e("div",{class:"intel-rank"}, htmlNode(flameIcon)),
+      e("div",{class:"intel-main"},
+        e("div",{class:"intel-name"}, (p.firstName+" "+p.lastName).trim(), p.company ? e("span",{class:"intel-co"}, " · "+p.company) : null),
+        e("div",{class:"intel-reason"}, "Keep warm — quick check-in today")
+      )
+    );
+  }
+
+  var checklistIcon = '<span class="intel-spark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></span>';
+  var goIcon = '<span class="wwon-go"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></span>';
+
+  // Dashboard panel — preview of active-cadence touches due now (LOI etc. live on the full page).
+  window.renderWhoToReachNext = function(prospects){
+    var main = mainReady(prospects);
+    var panel = e("div",{class:"intel-panel"});
+    panel.appendChild(e("button",{class:"intel-head wwon-head", title:"See everything to work on", onClick:function(){ navigate("work-now"); }},
+      htmlNode(checklistIcon),
+      e("div",{class:"intel-titles"},
+        e("div",{class:"intel-title"},"What to Work on Now"),
+        e("div",{class:"intel-sub"}, main.length ? (main.length + (main.length===1?" touch":" touches") + " due in your active cadences") : "Open your daily work list")
+      ),
+      htmlNode(goIcon)
+    ));
+    if(main.length){
+      main.slice(0,6).forEach(function(x){ panel.appendChild(workRow(x.p, x.t)); });
+    } else {
+      panel.appendChild(e("div",{class:"intel-empty"}, "No active-cadence touches due right now — tap to see calls set and keep-warm."));
+    }
+    return panel;
+  };
+
+  // Full page — active-cadence touches on top, then keep-warm categories (LOI Out, etc.).
+  window.viewWorkNow = function(){
+    var wrap = e("div",{class:"screen"});
+    var mine = myProspectsList();
+    var main = mainReady(mine);
+
+    wrap.appendChild(e("div",{class:"h-section"},
+      e("div",{},
+        e("h2",{},"What to Work on Now"),
+        e("div",{class:"sub"}, main.length + (main.length===1?" touch":" touches") + " due in your active cadences")
+      )
+    ));
+    if(!main.length){
+      wrap.appendChild(e("div",{class:"empty",style:"margin-top:20px"}, e("div",{class:"ic"},"✓"), "No cadence touches due right now."));
+    } else {
+      var panel = e("div",{class:"intel-panel"});
+      main.forEach(function(x){ panel.appendChild(workRow(x.p, x.t)); });
+      wrap.appendChild(panel);
+    }
+
+    // Calls set — closing checklist (Intro Call → Deeper Dive → Pricing → Benefits).
+    var callsSet = mine.filter(function(p){ return hasCallScheduled(p) && p.stage !== "closed"; });
+    callsSet.sort(function(a,b){ return closingProgress(a).done - closingProgress(b).done; }); // least progress first
+    if(callsSet.length){
+      wrap.appendChild(e("div",{class:"wn-group-head"},
+        e("h3",{}, "Calls set — closing checklist"),
+        e("span",{class:"wn-count"}, String(callsSet.length))
+      ));
+      var csp = e("div",{class:"intel-panel"});
+      callsSet.forEach(function(p){ csp.appendChild(callsSetRow(p)); });
+      wrap.appendChild(csp);
+    }
+
+    // Keep-warm categories — everyone in these stages gets a daily touch, grouped on their own.
+    KEEPWARM_STAGES.forEach(function(stageId){
+      var grp = keepWarmGroup(mine, stageId);
+      if(!grp.length) return;
+      var label = (typeof getStageLabel === "function") ? getStageLabel(stageId) : stageId;
+      wrap.appendChild(e("div",{class:"wn-group-head"},
+        e("h3",{}, label + " — keep warm today"),
+        e("span",{class:"wn-count"}, String(grp.length))
+      ));
+      var gp = e("div",{class:"intel-panel"});
+      grp.forEach(function(p){ gp.appendChild(keepWarmRow(p)); });
+      wrap.appendChild(gp);
+    });
+
+    return wrap;
+  };
+
+  // section-header styling
+  (function(){
+    var st = document.createElement("style");
+    st.textContent = ".wn-group-head{display:flex;align-items:center;gap:10px;margin:22px 0 8px}.wn-group-head h3{margin:0;font-size:14px;font-family:var(--font-h);color:var(--t-1)}.wn-group-head .wn-count{font-size:11px;font-weight:700;color:var(--brand-2);background:var(--brand-soft);border-radius:999px;padding:2px 9px}";
+    document.head.appendChild(st);
+  })();
+
+  /* ---- reply / done flow ---- */
+
+  // The task a pasted reply pertains to: the active one, else the last completed.
+  function currentReplyTask(p){
+    try { ensureChain(p); } catch(e){}
+    var t = currentTask(p);
+    if(t && t.status === "active") return t;
+    var done = chainDoneTasks(p);
+    return done.length ? done[done.length-1] : { channel:"sms", action:"a message" };
+  }
+
+  // Log a reply (with chosen/analyzed outcome) and plan the next move — works whether
+  // the touch is still active OR was already marked done (supersedes the scheduled follow-up).
+  function logReplyAndPlan(p, replyText, outcomeId){
+    ensureChain(p);
+    var active = currentTask(p);
+    if(active && active.status === "active"){
+      completeTaskWithOutcome(p, active, outcomeId, replyText);
+      return;
+    }
+    var ch = p.cadence.chain;
+    while(ch.length && ch[ch.length-1].status !== "done") ch.pop();   // drop the scheduled-but-not-done follow-up
+    var lastDone = ch.length ? ch[ch.length-1] : null;
+    if(replyText){ p.lastContact = Date.now(); logActivity(p.id, "reply", "Reply from " + (p.firstName||"prospect") + ": " + replyText.slice(0,160)); }
+    if(["replied-interested","asked-info","booked-call"].indexOf(outcomeId) !== -1 && typeof maybeAdvanceStage === "function") maybeAdvanceStage(p, STAGE_ENGAGED);
+    if(!p.cadence.responses) p.cadence.responses = [];
+    p.cadence.responses.push({ stepId:(lastDone&&lastDone.stepId)||null, taskId:(lastDone&&lastDone.id)||null, outcome:outcomeId, ts:Date.now(), by:state.user.id, reply:replyText||null });
+    var seed = lastDone || { channel:"sms", action:"Follow up" };
+    var next = planNextTask(p, seed, outcomeId);
+    next.status = "active";        // a reply just came in — make the next move actionable now
+    next.unlockAt = Date.now();
+    if(replyText) next.replyContext = replyText;
+    p.cadence.chain.push(next);
+    MOVE_CACHE.delete(p.id + ":task:" + next.id);
+    if(outcomeId === "booked-call" && typeof switchTemplate === "function" && !onClosingPlaybook(p)) switchTemplate(p, "active-recruit");
+    persist();
+  }
+
+  // The persistent reply box — lives under the touch, always available.
+  function renderReplyBox(p){
+    var fn = p.firstName || "they";
+    var box = e("div", { class:"tm-reply-box" });
+    box.appendChild(e("div", { class:"tm-respond-label" }, "Reply from " + fn + "? Paste it here whenever it comes in — AI reads it and plans the next move."));
+    var ta = e("textarea", { class:"tm-reply-ta", placeholder:"Paste " + fn + "'s reply (text, email, LinkedIn)…" });
+    box.appendChild(ta);
+    var aRow = e("div", { class:"tm-reply-actions" });
+    var btn = e("button", { class:"btn sm", onClick: async function(){
+      var txt = ta.value.trim();
+      if(!txt){ showToast("Paste their reply first, or pick a quick option"); return; }
+      btn.disabled = true; btn.textContent = "Reading their reply…";
+      var res = null; try { res = await analyzeReply(p, currentReplyTask(p), txt); } catch(e){}
+      if(!res){ btn.disabled = false; btn.textContent = "Analyze reply → plan next move"; showToast("Couldn't analyze — pick a quick option"); return; }
+      logReplyAndPlan(p, txt, res.outcome);
+      var ocl = (outcomeById(res.outcome) || {}).label || res.outcome;
+      showToast("Read as: " + ocl + " — next move drafted from their words");
+      navigate(state.screen, { replace:true });
+    } }, "Analyze reply → plan next move");
+    aRow.appendChild(btn);
+    box.appendChild(aRow);
+    box.appendChild(e("div", { class:"tm-respond-sub" }, "Or log it manually:"));
+    var grid = e("div", { class:"tm-outcomes" });
+    CADENCE_OUTCOMES.forEach(function(o){
+      grid.appendChild(e("button", { class:"tm-outcome " + o.sentiment, onClick:function(){
+        logReplyAndPlan(p, ta.value.trim() || null, o.id);
+        showToast("Logged — next move scheduled");
+        navigate(state.screen, { replace:true });
+      } }, e("span", { class:"tm-oc-ico" }, o.icon), o.label));
+    });
+    box.appendChild(grid);
+    return box;
+  }
+  window.rosRenderReplyBox = renderReplyBox;
+
+  // Replace the under-the-touch box: a clear "Mark done" + the persistent reply box.
+  window.renderTaskRespond = function(p, task){
+    var fn = p.firstName || "they";
+    var box = e("div", { class:"tm-respond" });
+    box.appendChild(e("div", { class:"tm-respond-label" }, "Did the touch go out?"));
+    var doneRow = e("div", { class:"tm-donerow" });
+    doneRow.appendChild(e("button", { class:"btn", onClick:function(){
+      completeTaskWithOutcome(p, task, "no-answer");
+      showToast("Marked done — next touch scheduled");
+      navigate(state.screen, { replace:true });
+    } }, "Mark done"));
+    doneRow.appendChild(e("button", { class:"btn subtle sm", onClick:function(){
+      completeTaskWithOutcome(p, task, "soft-engaged");
+      showToast("Nice — warm follow-up queued");
+      navigate(state.screen, { replace:true });
+    } }, fn + " engaged back"));
+    box.appendChild(doneRow);
+    box.appendChild(renderReplyBox(p));
+    return box;
+  };
+
+  // Locked (scheduled) next touch should still let you paste a reply that just arrived.
+  if(typeof window.renderLockedTask === "function"){
+    var _origLocked = window.renderLockedTask;
+    window.renderLockedTask = function(p, task){
+      var card = _origLocked(p, task);
+      try { if(state.user && state.user.role !== "viewer") card.appendChild(renderReplyBox(p)); } catch(e){}
+      return card;
+    };
+  }
+
+  /* ---- Peter's Playbook (Active Recruit) = a checklist, not the move engine ---- */
+  function onClosingPlaybook(p){ return !!(p && p.cadence && p.cadence.templateId === "active-recruit"); }
+  function hasCallScheduled(p){ return onClosingPlaybook(p); }
+  window.hasCallScheduled = hasCallScheduled;
+
+  function stepIsDone(p, stepId){
+    return !!(p.cadence && p.cadence.completed && p.cadence.completed.some(function(c){ return c.stepId === stepId && !c.taskId; }));
+  }
+  function taskIsDone(p, stepId, taskId){
+    return !!(p.cadence && p.cadence.completed && p.cadence.completed.some(function(c){ return c.stepId === stepId && c.taskId === taskId; }));
+  }
+  function toggleTask(p, stepId, taskId){
+    if(!p.cadence.completed) p.cadence.completed = [];
+    if(taskIsDone(p, stepId, taskId)){
+      p.cadence.completed = p.cadence.completed.filter(function(c){ return !(c.stepId === stepId && c.taskId === taskId); });
+    } else {
+      p.cadence.completed.push({ stepId: stepId, taskId: taskId, completedAt: Date.now(), completedBy: state.user.id });
+    }
+  }
+  function closingProgress(p){
+    var tpl = (typeof getTemplate === "function") ? getTemplate(p) : null;
+    var steps = (tpl && tpl.steps) || [];
+    var done = steps.filter(function(s){ return stepIsDone(p, s.id); }).length;
+    var next = steps.find(function(s){ return !stepIsDone(p, s.id); });
+    return { done:done, total: steps.length, next: next ? next.action : "All done" };
+  }
+
+  // Booking a call moves the prospect onto Peter's Playbook (the checklist surface).
+  if(typeof window.completeTaskWithOutcome === "function"){
+    var _origComplete = window.completeTaskWithOutcome;
+    window.completeTaskWithOutcome = function(p, task, outcomeId, replyText){
+      _origComplete(p, task, outcomeId, replyText);
+      if(outcomeId === "booked-call" && !onClosingPlaybook(p) && typeof switchTemplate === "function"){
+        switchTemplate(p, "active-recruit");
+      }
+    };
+  }
+
+  var checkSvg = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+  function renderPlaybookChecklist(p){
+    ensureCadence(p);
+    if(!p.cadence.completed) p.cadence.completed = [];
+    var tpl = getTemplate(p);
+    var wrap = e("div",{class:"pbchk"});
+    (tpl.steps || []).forEach(function(step, i){
+      var done = stepIsDone(p, step.id);
+      var card = e("div",{class:"pbchk-phase" + (done ? " done" : "")});
+      var header = e("div",{class:"pbchk-head"});
+      var box = e("button",{class:"pbchk-box" + (done ? " on" : ""), title: done ? "Mark phase not done" : "Mark phase done", onClick:function(){
+        if(done){ if(typeof uncompleteStep === "function") uncompleteStep(p, step.id); }
+        else { markStepDone(p, step.id, step.action); }
+        persist(); navigate(state.screen, { replace:true });
+      }}, done ? htmlNode(checkSvg) : String(i + 1));
+      header.appendChild(box);
+      var titles = e("div",{class:"pbchk-titles"});
+      var titleRow = e("div",{class:"pbchk-title"}, step.action);
+      if(step.optional) titleRow.appendChild(e("span",{class:"pbchk-opt"}, "Optional"));
+      titles.appendChild(titleRow);
+      var ch = CHANNELS[step.channel] || {};
+      titles.appendChild(e("div",{class:"pbchk-sub"}, (ch.label || step.channel || "")));
+      header.appendChild(titles);
+      card.appendChild(header);
+      if(step.prompt) card.appendChild(e("div",{class:"pbchk-prompt"}, step.prompt));
+      if(step.tasks && step.tasks.length){
+        var tl = e("div",{class:"pbchk-tasks"});
+        step.tasks.forEach(function(t){
+          var td = taskIsDone(p, step.id, t.id);
+          var trow = e("button",{class:"pbchk-task" + (td ? " done" : ""), onClick:function(){
+            toggleTask(p, step.id, t.id);
+            var all = step.tasks.every(function(x){ return taskIsDone(p, step.id, x.id); });
+            if(all && !stepIsDone(p, step.id)) markStepDone(p, step.id, step.action);
+            if(!all && stepIsDone(p, step.id) && typeof uncompleteStep === "function") uncompleteStep(p, step.id);
+            persist(); navigate(state.screen, { replace:true });
+          }},
+            e("span",{class:"pbchk-tick" + (td ? " on" : "")}, td ? htmlNode(checkSvg) : ""),
+            e("span",{class:"pbchk-tlabel"}, t.label)
+          );
+          tl.appendChild(trow);
+        });
+        card.appendChild(tl);
+      }
+      wrap.appendChild(card);
+    });
+    return wrap;
+  }
+
+  // For Peter's Playbook, the cadence surface IS the checklist (not the move engine).
+  if(typeof window.renderCadenceEngine === "function"){
+    var _origEngine = window.renderCadenceEngine;
+    window.renderCadenceEngine = function(p){
+      if(onClosingPlaybook(p)) return renderPlaybookChecklist(p);
+      return _origEngine(p);
+    };
+  }
+
+  function renderUpcoming(p){
+    if(!p.cadence || !p.cadence.startedAt) return null;
+    if(onClosingPlaybook(p)) return null;                 // checklist already shows every phase
+    var tpl = (typeof getTemplate === "function") ? getTemplate(p) : null;
+    if(!tpl || !tpl.steps) return null;
+    var upcoming = tpl.steps.filter(function(s){ return (typeof stepStatus === "function") && stepStatus(p, s) === "upcoming"; }).slice(0, 3);
+    if(!upcoming.length) return null;
+    var wrap = e("div",{class:"coming-up"});
+    wrap.appendChild(e("div",{class:"coming-up-label"},"Coming up"));
+    upcoming.forEach(function(s){
+      var ch = CHANNELS[s.channel] || {};
+      wrap.appendChild(e("div",{class:"coming-step"},
+        e("span",{class:"coming-ic"}, htmlNode(channelIconSvg(s.channel || "sms"))),
+        e("span",{class:"coming-txt"}, (ch.label || s.channel) + " · " + s.action),
+        e("span",{class:"coming-day"}, "Day " + s.day)
+      ));
+    });
+    return wrap;
+  }
+
+  // Row for a prospect on Peter's Playbook — phase progress + next phase.
+  function callsSetRow(p){
+    var prog = closingProgress(p);
+    return e("button",{class:"intel-row",onClick:function(){ navigate("prospect:"+p.id); }},
+      e("div",{class:"intel-rank cs-prog"}, prog.done + "/" + prog.total),
+      e("div",{class:"intel-main"},
+        e("div",{class:"intel-name"}, (p.firstName+" "+p.lastName).trim(), p.company ? e("span",{class:"intel-co"}, " · "+p.company) : null),
+        e("div",{class:"intel-reason"}, prog.next === "All done" ? "Playbook complete" : ("Next: " + prog.next))
+      )
+    );
+  }
+
+  // Playbook: fix the progress label for the checklist + append upcoming preview (cold cadences).
+  if(typeof window.pdPlaybook === "function"){
+    var _origPdPlaybook = window.pdPlaybook;
+    window.pdPlaybook = function(p){
+      var node = _origPdPlaybook(p);
+      try {
+        if(onClosingPlaybook(p)){
+          var prog = closingProgress(p);
+          var nums = node.querySelector(".pb-progress .nums");
+          if(nums) nums.textContent = prog.done + " / " + prog.total + " phases done";
+        }
+        var up = renderUpcoming(p);
+        if(up) node.appendChild(up);
+      } catch(err){ console.error("playbook add-ons failed", err); }
+      return node;
+    };
+  }
+
+  // small styling for the mark-done row + reply box spacing + closing checklist + coming-up
+  var s = document.createElement("style");
+  s.textContent = [
+    ".tm-donerow{display:flex;gap:8px;flex-wrap:wrap;margin:2px 0 14px}",
+    ".tm-reply-box{border-top:1px solid var(--line);padding-top:12px;margin-top:4px}",
+    ".pbchk{display:flex;flex-direction:column;gap:10px}",
+    ".pbchk-phase{border:1px solid var(--line);border-radius:12px;padding:12px 14px;background:var(--surface,#fff)}",
+    ".pbchk-phase.done{background:var(--brand-soft);border-color:var(--brand)}",
+    ".pbchk-head{display:flex;align-items:flex-start;gap:12px}",
+    ".pbchk-box{flex:0 0 auto;width:26px;height:26px;border-radius:50%;border:2px solid var(--line);background:transparent;color:var(--t-2);font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center;cursor:pointer}",
+    ".pbchk-box.on{background:var(--brand);border-color:var(--brand);color:#fff}",
+    ".pbchk-box svg{width:14px;height:14px}",
+    ".pbchk-titles{flex:1;min-width:0}",
+    ".pbchk-title{font-family:var(--font-h);font-size:15px;color:var(--t-1);display:flex;align-items:center;gap:8px;flex-wrap:wrap}",
+    ".pbchk-opt{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--t-3);border:1px solid var(--line);border-radius:999px;padding:1px 7px}",
+    ".pbchk-sub{font-size:12px;color:var(--t-3);margin-top:1px}",
+    ".pbchk-prompt{font-size:12.5px;color:var(--t-2);line-height:1.5;margin:8px 0 4px;padding-left:38px}",
+    ".pbchk-tasks{display:flex;flex-direction:column;gap:4px;margin-top:8px;padding-left:38px}",
+    ".pbchk-task{display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:transparent;border:none;padding:5px 0;cursor:pointer;font-size:13.5px;color:var(--t-1);font-family:inherit}",
+    ".pbchk-tick{flex:0 0 auto;width:18px;height:18px;border-radius:5px;border:2px solid var(--line);display:flex;align-items:center;justify-content:center;color:#fff}",
+    ".pbchk-tick.on{background:var(--brand);border-color:var(--brand)}",
+    ".pbchk-tick svg{width:11px;height:11px}",
+    ".pbchk-task.done .pbchk-tlabel{text-decoration:line-through;color:var(--t-3)}",
+    ".coming-up{margin-top:14px;padding-top:12px;border-top:1px dashed var(--line)}",
+    ".coming-up-label{font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--t-3);margin-bottom:8px}",
+    ".coming-step{display:flex;align-items:center;gap:10px;padding:7px 0;color:var(--t-3);font-size:13px}",
+    ".coming-step .coming-ic{width:18px;height:18px;opacity:.6;flex:0 0 auto}",
+    ".coming-step .coming-ic svg{width:18px;height:18px}",
+    ".coming-step .coming-txt{flex:1}",
+    ".coming-step .coming-day{font-size:11px;color:var(--t-3);opacity:.85}",
+    ".cs-prog{font-size:12px;font-weight:800;color:var(--brand-2)}",
+    ".intel-empty{font-size:12.5px;color:var(--t-3);padding:10px 4px 4px}"
+  ].join("");
+  document.head.appendChild(s);
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — RESEARCH AUTO-FILL
+     After a research run, fill any EMPTY Overview field from the
+     dossier: company, market, NMLS, LinkedIn, phone, email, position,
+     annual production, monthly volume, and units. Never overwrites a
+     field the user already filled.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+
+  function firstFilled(){
+    for(var i=0;i<arguments.length;i++){
+      var v = arguments[i];
+      if(v != null && String(v).trim() !== "" && String(v).trim().toLowerCase() !== "null") return String(v).trim();
+    }
+    return "";
+  }
+  function parseMoneyM(s){
+    if(!s) return null;
+    var str = String(s).replace(/,/g, "");
+    var m = str.match(/\$?\s*([\d.]+)\s*[mM]\b/);
+    if(m) return parseFloat(m[1]);
+    var b = str.match(/\$?\s*([\d.]+)\s*[bB]\b/);
+    if(b) return parseFloat(b[1]) * 1000;
+    var n = str.match(/([\d.]+)/);
+    if(n){ var val = parseFloat(n[1]); if(val > 100000) return Math.round(val / 1e6 * 10) / 10; }
+    return null;
+  }
+  function parseUnits(s){ if(!s) return null; var m = String(s).match(/(\d+)/); return m ? parseInt(m[1], 10) : null; }
+  function isEmpty(v){ return v == null || v === "" || (typeof v === "number" && v === 0); }
+
+  function applyResearchToProspect(p){
+    var r = p.research; if(!r || r.error) return;
+    var prof = r.profile || {};
+    var recent = null;
+    if(Array.isArray(r.timeline) && r.timeline.length){
+      recent = r.timeline.slice().sort(function(a,b){
+        var ea = (a.endYear == null ? 9999 : a.endYear), eb = (b.endYear == null ? 9999 : b.endYear);
+        return eb - ea;
+      })[0];
+    }
+    var filled = [];
+    function setIf(field, val){ if(val && isEmpty(p[field])){ p[field] = val; filled.push(field); } }
+
+    setIf("company",  firstFilled(prof.company, recent && recent.employer));
+    setIf("market",   firstFilled(prof.market, recent && recent.location));
+    setIf("nmls",     firstFilled(prof.nmls).replace(/\D/g, ""));
+    setIf("linkedin", firstFilled(prof.linkedin));
+    setIf("phone",    firstFilled(prof.phone));
+    setIf("email",    firstFilled(prof.email));
+    if(prof.position && isEmpty(p.position)){ p.position = firstFilled(prof.position); filled.push("position"); }
+
+    var pe = r.productionEstimate || {};
+    var volM = parseMoneyM(firstFilled(pe.volume));
+    if(volM != null){
+      if(isEmpty(p.estProduction)){ p.estProduction = volM; filled.push("production"); }
+      if(isEmpty(p.monthlyVolume)){ p.monthlyVolume = Math.round(volM * 1e6 / 12); filled.push("volume"); }
+    }
+    var units = parseUnits(pe.units);
+    if(units != null && isEmpty(p.selfUnits)){ p.selfUnits = units; filled.push("units"); }
+
+    if(filled.length){
+      if(typeof ensureReportingFields === "function") ensureReportingFields(p);
+      persist();
+      if(typeof showToast === "function") showToast("Overview auto-filled from research (" + filled.length + " field" + (filled.length === 1 ? "" : "s") + ")");
+    }
+  }
+  window.applyResearchToProspect = applyResearchToProspect;
+
+  // Run the auto-fill right after any research completes.
+  if(typeof window.runResearch === "function"){
+    var _origRunResearch = window.runResearch;
+    window.runResearch = async function(p, opts){
+      await _origRunResearch(p, opts);
+      try { if(p && p.research && !p.research.error) applyResearchToProspect(p); } catch(e){ console.error("research auto-fill failed", e); }
+      if(state.user && typeof navigate === "function") navigate(state.screen, { replace:true });
+    };
+  }
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — WHAT'S WORKING NOW + SENT LOGGING
+     A library of sendable pieces (Peter's podcast, Leif webinar,
+     custom presentation, AI tools, all-hands invite, how we pay,
+     reverse site, Spanish site). Sending one logs it on the prospect
+     so warm outreach shows what's already gone out and you don't send
+     the same thing twice. Links are editable and sync to the team.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+
+  var WHATS_WORKING_NOW = [
+    { id:"wwn-podcast",      label:"Peter's podcast",       emoji:"🎙️", blurb:"Check in + share a podcast clip.",
+      brief:"Casually check in and share a recent episode or clip from Peter's podcast. Vibe: 'Hey [First], just checking in — wanted to send you a clip from my podcast I thought you'd like.' Warm and brief." },
+    { id:"wwn-webinar",      label:"Leif webinar invite",   emoji:"📺", blurb:"Invite them to Leif's webinar.",
+      brief:"Invite them to Leif Boyd's upcoming webinar. Warm, short, low-pressure — frame it around what they'll get out of it." },
+    { id:"wwn-presentation", label:"Custom presentation",   emoji:"🖥️", blurb:"Offer a tailored presentation.",
+      brief:"Offer to put together a quick custom presentation built around their specific business. Short and concrete." },
+    { id:"wwn-aitools",      label:"AI tools",              emoji:"⚙️", blurb:"Talk up what we're doing with AI.",
+      brief:"A casual note about how much we're doing with AI right now and the tools we've built for our producers. 'Thought you'd find this cool' energy — not salesy." },
+    { id:"wwn-allhands",     label:"All-hands call invite", emoji:"📣", blurb:"Invite them to an all-hands meeting.",
+      brief:"Invite them to our all-hands-on-deck meeting. Leave the date and time as a blank line (____) for the sender to fill in. Short and warm." },
+    { id:"wwn-howwepay",     label:"How we pay",            emoji:"💵", blurb:"Open the door on comp.",
+      brief:"A casual open-door note offering to walk them through how we pay. No specific numbers — just an easy invitation to talk it through." },
+    { id:"wwn-reverse",      label:"Reverse site",          emoji:"🔁", blurb:"What's happening in reverse.",
+      brief:"Let them know we've got a lot going on in our reverse mortgage department and it could be another revenue lane for them. Short." },
+    { id:"wwn-spanish",      label:"Spanish site",          emoji:"🌐", blurb:"Share the Spanish referral site.",
+      brief:"Let them know we have a Spanish referral site for Spanish-speaking clients — a way to serve more borrowers in their market. Short." }
+  ];
+  window.WHATS_WORKING_NOW = WHATS_WORKING_NOW;
+
+  function linkFor(id){ return (state.contentLinks && state.contentLinks[id]) || ""; }
+  function setLink(id, url){
+    if(!state.contentLinks) state.contentLinks = {};
+    state.contentLinks[id] = (url || "").trim();
+    persist();
+  }
+  function lastSentAt(p, id){ return (p.outreachSent && p.outreachSent[id]) ? p.outreachSent[id].at : null; }
+  function markOutreachSent(p, id, label){
+    if(!p.outreachSent) p.outreachSent = {};
+    p.outreachSent[id] = { at: Date.now(), by: state.user.id };
+    if(typeof logActivity === "function") logActivity(p.id, "outreach-sent", "Sent: " + label);
+    persist();
+  }
+  window.markOutreachSent = markOutreachSent;
+
+  // Log the send whenever a warm-outreach play OR a What's Working Now piece is composed.
+  if(typeof window.quickWarmNudge === "function"){
+    var _origQWN = window.quickWarmNudge;
+    window.quickWarmNudge = async function(p, nudge){
+      try { if(nudge && nudge.id) markOutreachSent(p, nudge.id, nudge.label || "outreach"); } catch(e){}
+      return _origQWN(p, nudge);
+    };
+  }
+
+  function composeWWNInModal(p, item){
+    var fn = p.firstName || "there";
+    var sender = (state.user && state.user.name) || "";
+    var sys = "You are writing a short, casual, peer-to-peer outreach message that "
+      + (sender ? sender : "a recruiter at Partners Mortgage")
+      + " will text or DM to a mortgage loan officer named " + fn + ". "
+      + "Write ONLY the message body — no subject line, no preamble, no surrounding quotation marks, no formal sign-off block. "
+      + "Keep it 2 to 4 sentences, warm and human, on a first-name basis. "
+      + "Do NOT include any links or URLs — the sender attaches the link themselves when they send. "
+      + "If a specific date or time is needed, leave a blank line like ____ for the sender to fill in."
+      + (typeof voicePromptSegment === "function" ? voicePromptSegment(state.user) : "");
+    var brand = (state.brandFacts) ? state.brandFacts : (typeof DEFAULT_BRAND_FACTS !== "undefined" ? DEFAULT_BRAND_FACTS : "");
+    var userPrompt = "Message goal: " + item.brief
+      + "\n\nProspect: " + fn + (p.company ? (" at " + p.company) : "")
+      + (p.pain ? ("\nWhat they care about: " + p.pain) : "")
+      + "\n\nBackground you may weave in only if it genuinely helps (don't force it, no links):\n" + brand;
+
+    showModal(item.label, function(modal, close){
+      modal.appendChild(e("p",{class:"muted",style:"font-size:12.5px;margin:0 0 10px;line-height:1.5"},
+        "Auto-drafted for " + fn + ". Tweak it, copy it, then paste your link when you send."));
+      var ta = e("textarea",{class:"wo-msg-ta"});
+      ta.placeholder = "Writing the message\u2026";
+      modal.appendChild(ta);
+
+      var linkRow = e("div",{class:"wo-linkrow"});
+      var url = linkFor(item.id);
+      if(url){
+        linkRow.appendChild(e("span",{},"Link to attach: "));
+        linkRow.appendChild(e("span",{class:"wo-linkurl"}, url));
+      }
+      modal.appendChild(linkRow);
+
+      var copyBtn = e("button",{class:"btn", onClick:function(){
+        var txt = (ta.value || "").trim();
+        if(!txt){ showToast("Nothing to copy yet"); return; }
+        navigator.clipboard.writeText(txt).then(function(){
+          markOutreachSent(p, item.id, item.label);
+          showToast("Copied \u2014 logged as sent to " + fn);
+          close();
+        }, function(){ showToast("Copy failed"); });
+      }}, "Copy message");
+
+      var linkBtn = url
+        ? e("button",{class:"btn subtle sm", onClick:function(){ navigator.clipboard.writeText(url).then(function(){ showToast("Link copied"); }); }}, "Copy link")
+        : e("button",{class:"btn subtle sm", onClick:function(){
+            if(typeof uiPrompt === "function"){ uiPrompt("Link for \u201C" + item.label + "\u201D", { value:"", placeholder:"https://\u2026" }, function(v){ setLink(item.id, v); if(v) showToast("Link saved"); close(); composeWWNInModal(p, item); }); }
+          }}, "Add link");
+
+      var regenBtn = e("button",{class:"btn ghost sm", onClick:function(){ generate(); }}, "Regenerate");
+
+      modal.appendChild(e("div",{class:"modal-actions"}, copyBtn, linkBtn, regenBtn, e("button",{class:"btn ghost", onClick:close}, "Close")));
+
+      function generate(){
+        ta.value = ""; ta.placeholder = "Writing the message\u2026"; copyBtn.disabled = true; regenBtn.disabled = true;
+        callAnthropic(userPrompt, { system: sys, maxTokens: 400, label: "WWN: " + item.label })
+          .then(function(out){ ta.value = (out || "").toString().trim(); ta.placeholder = ""; copyBtn.disabled = false; regenBtn.disabled = false; })
+          .catch(function(err){ ta.placeholder = "Couldn't generate \u2014 make sure you're online, then tap Regenerate."; copyBtn.disabled = false; regenBtn.disabled = false; showToast("Generation failed"); });
+      }
+      generate();
+    });
+  }
+  window.composeWWNInModal = composeWWNInModal;
+
+  function fmtSent(ts){
+    try { return new Date(ts).toLocaleDateString(undefined, { month:"short", day:"numeric" }); } catch(e){ return "sent"; }
+  }
+
+  function outreachCard(p, item, onSend, withLink){
+    var sent = lastSentAt(p, item.id);
+    var card = e("div",{ class:"wo-card" + (sent ? " sent" : "") });
+    card.addEventListener("mouseenter", function(){ card.style.borderColor = "var(--brand)"; });
+    card.addEventListener("mouseleave", function(){ card.style.borderColor = "var(--line)"; });
+    var head = e("div",{class:"wo-card-head", onClick:function(){ onSend(); }});
+    head.appendChild(e("div",{class:"wo-emoji"}, item.emoji));
+    var txt = e("div",{class:"wo-txt"});
+    txt.appendChild(e("div",{class:"wo-label"}, item.label));
+    txt.appendChild(e("div",{class:"wo-blurb"}, item.blurb || item.description || ""));
+    head.appendChild(txt);
+    card.appendChild(head);
+    var foot = e("div",{class:"wo-foot"});
+    foot.appendChild(e("span",{class:"wo-sent" + (sent ? " on" : "")}, sent ? ("Sent " + fmtSent(sent)) : "Not sent yet"));
+    if(withLink){
+      var has = !!linkFor(item.id);
+      foot.appendChild(e("button",{class:"wo-linkbtn", onClick:function(ev){
+        ev.stopPropagation();
+        if(typeof uiPrompt === "function"){
+          uiPrompt("Share link for \u201C" + item.label + "\u201D", { value: linkFor(item.id), placeholder:"https://\u2026" }, function(v){
+            setLink(item.id, v); showToast(v ? "Link saved" : "Link cleared"); navigate(state.screen, { replace:true });
+          });
+        }
+      }}, has ? "Edit link" : "Add link"));
+    }
+    card.appendChild(foot);
+    return card;
+  }
+
+  // Reworked picker: renamed to Warm outreach, adds What's Working Now, shows sent status.
+  window.openWarmNudgePicker = function(p){
+    showModal("Send warm outreach", function(modal, close){
+      modal.appendChild(e("p",{class:"muted",style:"font-size:13px;margin:0 0 6px;line-height:1.5"},
+        "Keep the relationship warm without burning a real funnel step. Anything already sent to " + (p.firstName || "them") + " is marked, so you don't repeat."
+      ));
+
+      modal.appendChild(e("div",{class:"wo-section-label"}, "What's working now"));
+      var g1 = e("div",{class:"wo-grid"});
+      WHATS_WORKING_NOW.forEach(function(item){
+        g1.appendChild(outreachCard(p, item, function(){ close(); composeWWNInModal(p, item); }, false));
+      });
+      modal.appendChild(g1);
+
+      if(typeof WARM_NUDGES !== "undefined" && WARM_NUDGES.length){
+        modal.appendChild(e("div",{class:"wo-section-label"}, "Quick plays"));
+        var g2 = e("div",{class:"wo-grid"});
+        WARM_NUDGES.forEach(function(n){
+          g2.appendChild(outreachCard(p, n, function(){ close(); quickWarmNudge(p, n); }, false));
+        });
+        modal.appendChild(g2);
+      }
+
+      modal.appendChild(e("div",{class:"modal-actions"},
+        e("button",{class:"btn ghost", onClick: close}, "Close")
+      ));
+    });
+  };
+
+  var st = document.createElement("style");
+  st.textContent = [
+    ".wo-section-label{font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;color:var(--t-3);margin:16px 0 8px}",
+    ".wo-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}",
+    ".wo-card{border:1px solid var(--line);border-radius:10px;background:var(--surface-2,#f6f7f8);transition:border-color .15s;display:flex;flex-direction:column}",
+    ".wo-card.sent{opacity:.62}",
+    ".wo-card-head{display:flex;gap:10px;align-items:flex-start;padding:12px 12px 8px;cursor:pointer}",
+    ".wo-emoji{font-size:22px;line-height:1}",
+    ".wo-txt{min-width:0}",
+    ".wo-label{font-family:var(--font-h);font-weight:700;font-size:13.5px;color:var(--t-1);margin-bottom:3px}",
+    ".wo-blurb{font-size:11.5px;color:var(--t-2);line-height:1.45}",
+    ".wo-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 12px 10px}",
+    ".wo-sent{font-size:11px;color:var(--t-3)}",
+    ".wo-sent.on{color:var(--brand-2);font-weight:700}",
+    ".wo-linkbtn{font-size:11px;font-weight:600;color:var(--brand-2);background:transparent;border:0;cursor:pointer;padding:2px 4px}",
+    ".wo-linkbtn:hover{text-decoration:underline}",
+    ".wo-msg-ta{width:100%;box-sizing:border-box;border:1px solid var(--line);border-radius:10px;padding:12px;font:inherit;font-size:14px;line-height:1.55;color:var(--t-1);background:var(--surface,#fff);resize:vertical;min-height:140px}",
+    ".wo-linkrow{margin-top:8px;font-size:12px;color:var(--t-3);word-break:break-all}",
+    ".wo-linkurl{color:var(--brand-2)}",
+    ".modal-actions{flex-wrap:wrap}",
+    "@media (max-width:560px){ .wo-grid{grid-template-columns:1fr} }"
+  ].join("");
+  document.head.appendChild(st);
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — MOBILE / iPHONE LAYER
+     Responsive rules so the app is usable on an iPhone: no sideways
+     scroll, safe-area insets, single-column grids, scrollable tabs
+     and tables, full-width modals, and inputs that don't trigger the
+     iOS zoom. Loaded last so it wins the cascade on small screens.
+     ============================================================ -->
+<style>
+  /* Safe-area padding around the notch / home bar */
+  @supports (padding: max(0px)) {
+    .topbar, .topbar-inner {
+      padding-left: max(14px, env(safe-area-inset-left));
+      padding-right: max(14px, env(safe-area-inset-right));
+    }
+  }
+
+  @media (max-width: 760px) {
+    /* --- global containment: nothing scrolls sideways or overflows --- */
+    html, body { max-width: 100%; overflow-x: hidden; -webkit-text-size-adjust: 100%; }
+    *, *::before, *::after { box-sizing: border-box; }
+    img, video, canvas, svg, iframe { max-width: 100%; }
+    #app, .main, #main { width: 100% !important; max-width: 100% !important; }
+    .main, #main { padding-left: 14px !important; padding-right: 14px !important; padding-bottom: calc(24px + env(safe-area-inset-bottom)) !important; }
+    .topbar-inner { gap: 6px !important; }
+    .tb-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+
+    /* --- collapse content & form grids to a single column --- */
+    .compare-grid, .fg-2, .fg-3, .fg-4, .fg-auto, .field-row, .field-row-3,
+    .form-grid, .form-grid.two, .grid-2, .grid-3, .gt-board-row, .gt-grid,
+    .hero-inner, .hv-row, .ia-res, .lend-grid, .mkt-grid, .mmb-grid, .mp-topic-grid,
+    .notes-grid, .p-cc-grid, .p-closing, .p-comp-grid, .p-cover, .p-cover-meta,
+    .p-roadmap, .p-uplift-grid, .p-values-grid, .p-y2-grid, .pg, .price-grid,
+    .qa-bar, .qa-grid, .qs-grid-2, .qs-grid-3, .quickstart, .rec-vid-grid,
+    .rpt-active-grid, .rpt-hires-grid, .rs-prod-fields, .seas-grid, .team-row,
+    .tm-outcomes, .tpl-grid, .report-grid, .user-grid, .wo-grid, .wz-fields.two,
+    .calc-preview-row, .lend-grid, .mkt-grid {
+      grid-template-columns: 1fr !important;
+    }
+
+    /* --- small stat tiles stay 2-up (nicer than a tall stack) --- */
+    .kpis, .kpi-grid, .kpi-row, .rpt-kpis, .p-kpi-grid, .team-stats,
+    .club-tiers, .role-tiles, .track-tiles {
+      grid-template-columns: repeat(2, 1fr) !important;
+    }
+
+    /* --- rein in wide fixed-width wrappers so they don't force sideways scroll --- */
+    .club-foot, .club-head, .club-in, .comp-fineprint, .comp-head, .comp-wrap,
+    .content, .cta-in, .cta-sb, .gt-footnote, .gt-head, .gt-in, .gt-slider-lead,
+    .hero-inner, .hero-opener, .hero-viz, .ia-head, .ia-in, .lend-foot, .lend-head,
+    .lend-in, .library, .mkt-head, .mkt-in, .mmb-head, .mmb-in, .mmb-lede,
+    .note-expanded-content, .notes-panel, .p-cover-meta, .p-cover-photo, .p-section,
+    .p-section h2, .p-section .p-lead, .price-head, .price-in, .rec-card, .s-sub,
+    .s-title, .section-inner, .setup-card, .spot-in, .spot-sub, .video-fr, .video-h,
+    .video-in, .login-card {
+      max-width: 100% !important;
+      width: auto !important;
+    }
+
+    /* --- presentation / overlay surfaces: let them scroll and shrink padding --- */
+    body.wow-active #main, body.proforma-active #main,
+    .p-section, .section-inner, .comp-wrap, .club-in, .gt-in, .mkt-in, .lend-in,
+    .price-in, .ia-in, .mmb-in, .video-in, .cta-in, .content {
+      padding-left: 16px !important; padding-right: 16px !important;
+    }
+
+    /* --- tabs scroll sideways instead of wrapping/overflowing --- */
+    .pd-tabs { overflow-x: auto; flex-wrap: nowrap; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    .pd-tabs::-webkit-scrollbar { display: none; }
+    .pd-tab { white-space: nowrap; flex: 0 0 auto; }
+
+    /* --- wide tables scroll rather than break --- */
+    table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+
+    /* --- action rows wrap --- */
+    .pd-actions-row, .modal-actions, .gen-actions, .tm-reply-actions, .tm-lock-actions { flex-wrap: wrap; }
+
+    /* --- comfortable tap targets --- */
+    .btn, .act-item, .act-trigger, .pd-tab, .intel-row, .wo-card-head, .closing-item,
+    .pbchk-task, .pbchk-box, .tm-outcome, .kanban-col-head { min-height: 40px; }
+
+    /* --- prevent iOS auto-zoom on focus --- */
+    input, select, textarea { font-size: 16px !important; }
+
+    /* --- modals + popovers fit the screen --- */
+    .modal, .modal.wide, .modal-card, .modal-content {
+      width: calc(100vw - 24px) !important;
+      max-width: calc(100vw - 24px) !important;
+      max-height: 88vh; overflow-y: auto;
+    }
+    .act-pop { max-width: min(92vw, 320px); }
+
+    /* --- card padding trims --- */
+    .card { padding: 14px !important; }
+  }
+
+  @media (max-width: 460px) {
+    /* very small screens: stat tiles go single column too */
+    .kpis, .kpi-grid, .kpi-row, .rpt-kpis, .p-kpi-grid, .team-stats,
+    .club-tiers, .role-tiles, .track-tiles { grid-template-columns: 1fr !important; }
+    .wo-grid { grid-template-columns: 1fr !important; }
+    .topbar .tb-title { display: none; }
+  }
+</style>
 </body>
 </html>
