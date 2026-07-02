@@ -15600,6 +15600,21 @@ const db = {
       // Wait for auth before writing — otherwise rules requiring auth will reject
       if(!fb.user) await new Promise(res => window.addEventListener("firebase-auth-ready", res, { once: true }));
       const ref = fb.doc(fb.fdb, ...FS_DOC_PATH);
+      // SAFETY GUARD: never let a much-smaller dataset overwrite a larger real
+      // one in the cloud. This stops a stale/partial copy (or a bad migration)
+      // from wiping people. Big shrinks are refused unless explicitly allowed
+      // (window._allowShrinkPush = true, set only around intentional bulk ops).
+      try{
+        const outCount = (snapshot.prospects || []).length;
+        const cur = await fb.getDoc(ref);
+        const cloudCount = (cur && cur.exists() && cur.data().prospects) ? cur.data().prospects.length : 0;
+        if(!window._allowShrinkPush && (cloudCount - outCount) > 2){
+          setCloudStatus("synced");
+          console.warn("[cloud] push REFUSED — would shrink cloud " + cloudCount + " → " + outCount + " prospects");
+          if(typeof showToast === "function") showToast("Sync paused: cloud has " + cloudCount + " people, this copy has " + outCount + ". Not overwriting.");
+          return;
+        }
+      } catch(gErr){ console.warn("[cloud] pre-push size check failed, proceeding", gErr); }
       // Firestore rejects undefined values (it allows null, but not undefined).
       // Scrub the whole tree before sending so a stray undefined anywhere in
       // a deep nested object can't bring down the entire sync.
@@ -26663,7 +26678,12 @@ if(params.get("u") && params.get("pin")){
       });
     } catch(e){ console.error("stage migrate", e); }
   }
-  setTimeout(migrateStages, 700); // defer so cloud/local data has loaded first
+  // DISABLED: auto-migration on load was firing before the user loaded
+  // (state.user null → crash) and, combined with live sync, could push a
+  // partial dataset over a fuller one. Stages are already migrated; leaving
+  // this off. Can be run manually via window.__runStageMigration() if needed.
+  window.__runStageMigration = migrateStages;
+  // setTimeout(migrateStages, 700);
 })();
 </script>
 </body>
