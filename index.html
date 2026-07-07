@@ -1444,7 +1444,7 @@ hr.div{border:0;border-top:1px solid var(--line);margin:14px 0}
 .rpt-section { margin-bottom: 28px; }
 .rpt-h2 { font-family: var(--font-h); font-size: 16px; font-weight: 700; color: var(--t-1); letter-spacing: 0.04em; text-transform:uppercase; border-bottom: 1px solid var(--line); padding-bottom: 6px; margin: 0 0 14px; }
 /* --- Report overhaul: KPI band, editable bands, row menus --- */
-.rpt-kpis{display:grid;grid-template-columns:repeat(7,1fr);gap:10px;margin:0 0 26px}
+.rpt-kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:0 0 26px}
 .rpt-ai{position:relative;margin:0 0 24px;padding:16px 18px;border-radius:14px;border:1px solid var(--line);
   background:linear-gradient(135deg,var(--brand-soft),rgba(255,255,255,0) 70%),var(--surface);
   box-shadow:0 1px 2px rgba(11,38,42,.04)}
@@ -15619,11 +15619,27 @@ const db = {
       // Scrub the whole tree before sending so a stray undefined anywhere in
       // a deep nested object can't bring down the entire sync.
       const safe = deepStripUndefined({ ...snapshot, _updatedAt: Date.now() });
+      // SIZE GUARD: Firestore hard-caps a document at ~1 MB. If the snapshot is
+      // getting close, the write will eventually fail SILENTLY and profiles will
+      // drift apart. Surface it loudly (once per session) so it can be addressed
+      // (usually by archiving old activity) instead of quietly breaking sync.
+      try{
+        const bytes = new Blob([JSON.stringify(safe)]).size;
+        if(bytes > 900000 && !window._sizeWarned){
+          window._sizeWarned = true;
+          console.warn("[cloud] snapshot " + Math.round(bytes/1024) + "KB — approaching Firestore's 1MB per-document limit");
+          if(typeof showToast === "function") showToast("Heads up: your data is large (" + Math.round(bytes/1024) + " KB). Near 1 MB, syncing can fail. Consider archiving old activity.");
+        }
+      }catch(e){}
       await fb.setDoc(ref, safe);
       setCloudStatus("synced");
     } catch(err){
       console.warn("[cloud] write failed", err);
       setCloudStatus("error", err);
+      // Make a size-limit failure loud instead of silent.
+      if(/longer than|1048576|exceeds maximum|too large/i.test(String((err && err.message) || "")) && typeof showToast === "function"){
+        showToast("Sync failed: your data passed Firestore's 1 MB limit. Old activity needs archiving before syncing works again.");
+      }
       throw err;
     }
   },
@@ -15746,6 +15762,7 @@ async function syncFromCloudOnBoot(){
     state.brandFacts       = (typeof cloud.brandFacts === "string") ? cloud.brandFacts : null;
     // state.stages already set above (always pulled)
     if(cloud.contentLinks && typeof cloud.contentLinks === "object") state.contentLinks = cloud.contentLinks;
+    if(cloud.msgsSentManual && typeof cloud.msgsSentManual === "object") state.msgsSentManual = cloud.msgsSentManual;
     state.lastModified     = cloudTime;
     // Heal any legacy stage values that arrived in the cloud prospects (e.g.
     // someone on an old cached tab wrote prospects with "New Prospect" instead
@@ -15779,6 +15796,7 @@ const state = {
   reportNote: "",              // free-text leadership note shown on the pipeline report
   stages: null,                // admin-editable pipeline stages: array of {id,label}. null = use DEFAULT_STAGES
   contentLinks: {},            // What's Working Now: editable share links keyed by item id (synced)
+  msgsSentManual: {},          // Messages sent MTD: manual per-month value {YYYY-MM:n}, never auto-counted (synced)
   lastModified: 0,             // timestamp of last user-driven change (used for sync)
   filters: { q:"", stage:"all", recruiter:"all", tier:"all", due:"all", tag:"all" },
   history: [],                 // back-stack
@@ -15810,6 +15828,7 @@ function stateToPersist(){
     reportNote:       state.reportNote,
     stages:           state.stages || null,
     contentLinks:     state.contentLinks || {},
+    msgsSentManual:   state.msgsSentManual || {},
     lastModified:    state.lastModified
   };
 }
@@ -16385,9 +16404,8 @@ function viewDashboard(){
     wrap.appendChild(banner);
   }
 
-  const myProspects = state.prospects.filter(p =>
-    state.user.role === "admin" || state.user.role === "viewer" || p.assignedTo === state.user.id
-  );
+  // Shared team pipeline — everyone sees the whole team's prospects.
+  const myProspects = state.prospects.slice();
 
   // Compute cadence-based queues
   const cadenceDueToday = [];
@@ -16984,9 +17002,9 @@ function tdCleanup(){
 function visibleProspects(){
   const f = state.filters;
   let arr = state.prospects.slice();
-  if(state.user.role !== "admin" && state.user.role !== "viewer"){
-    arr = arr.filter(p => p.assignedTo === state.user.id);
-  } else if(f.recruiter !== "all"){
+  // Shared team pipeline: everyone sees all prospects. The "All recruiters"
+  // dropdown is an optional lens to narrow to one recruiter.
+  if(f.recruiter && f.recruiter !== "all"){
     arr = arr.filter(p => p.assignedTo === f.recruiter);
   }
   if(f.q){
@@ -20730,7 +20748,7 @@ async function callAnthropic(userPrompt, opts = {}){
   const body = {
     model: opts.model || CONFIG.anthropicModel,
     max_tokens: opts.maxTokens || 1024,
-    messages: [{ role: "user", content: userPrompt }]
+    messages: [{ role: "user", content: opts.content || userPrompt }]
   };
   if(opts.system) body.system = opts.system;
   if(opts.tools)  body.tools  = opts.tools;
@@ -22667,6 +22685,7 @@ function viewReports(){
   const actions = e("div",{class:"rpt-header-actions"});
   if(canEdit) actions.appendChild(e("button",{class:"btn sm", onClick:()=>openAddToBand("Green")}, "+ Add prospect"));
   actions.appendChild(e("button",{class:"btn sm subtle", onClick:()=>window.print()}, "Print / Save PDF"));
+  if(canEdit) actions.appendChild(e("button",{class:"btn sm subtle", onClick:()=>{ if(window.openReportImporter) window.openReportImporter(); }}, "Import report"));
   header.appendChild(actions);
   wrap.appendChild(header);
 
@@ -22736,10 +22755,28 @@ function viewReports(){
   kpiBand.appendChild(rkpi("Red", String(reds.length), "bad"));
   kpiBand.appendChild(rkpi("LOIs out", String(loi.length)));
   kpiBand.appendChild(rkpi("Hires YTD", String(hiresYTD.length), "good"));
-  // Outbound messages sent this month — texts, LinkedIn DMs, emails, and warm-outreach / What's Working Now sends.
-  const OUTBOUND_MSG_TYPES = ["text-sent","linkedin-sent","email-sent","outreach-sent"];
-  const msgsMTD = (state.activities || []).filter(a => a && OUTBOUND_MSG_TYPES.indexOf(a.type) !== -1 && a.ts >= monthStartTs).length;
-  kpiBand.appendChild(rkpi("Messages sent MTD", String(msgsMTD), "accent"));
+  // Messages sent this month — a number YOU set. It is NOT auto-counted from
+  // activity logs (LinkedIn / texts / emails), so outside numbers can't change it.
+  const ymKey = new Date().toISOString().slice(0, 7); // YYYY-MM
+  const msgsManual = (state.msgsSentManual && state.msgsSentManual[ymKey] != null) ? state.msgsSentManual[ymKey] : 0;
+  const msgTile = rkpi("Messages sent MTD", String(msgsManual), "accent");
+  if(canEdit){
+    msgTile.style.cursor = "pointer";
+    msgTile.title = "Click to edit — you set this number; it isn't auto-counted";
+    msgTile.addEventListener("click", function(){
+      uiPrompt("Messages sent this month", { value: String(msgsManual), placeholder: "e.g. 120" }, function(v){
+        if(v == null) return;
+        var n = parseInt(String(v).replace(/[^0-9]/g, ""), 10);
+        if(isNaN(n)) return;
+        if(!state.msgsSentManual) state.msgsSentManual = {};
+        state.msgsSentManual[ymKey] = n;
+        persist();
+        navigate(state.screen, { replace:true });
+      });
+    });
+    msgTile.appendChild(e("div",{style:"font-size:10px;color:var(--brand-2);margin-top:5px;font-weight:600"}, "\u270E Tap to edit"));
+  }
+  kpiBand.appendChild(msgTile);
   wrap.appendChild(kpiBand);
 
   // ===== EXEC SUMMARY (auto + editable note) =====
@@ -25080,9 +25117,7 @@ if(params.get("u") && params.get("pin")){
   "use strict";
   function viewWorkNow(){
     const wrap = e("div",{class:"screen"});
-    const mine = state.prospects.filter(p =>
-      state.user.role === "admin" || state.user.role === "viewer" || p.assignedTo === state.user.id
-    );
+    const mine = state.prospects.slice(); // shared team pipeline — everyone sees all
     const list = mine
       .filter(p => p.stage !== "closed" && !(window.isDNC && isDNC(p)))
       .map(p => ({ p, t: Math.max(p.createdAt||0, (typeof lastTouchTs === "function" ? (lastTouchTs(p)||0) : 0)) }))
@@ -25193,6 +25228,7 @@ if(params.get("u") && params.get("pin")){
     if(typeof cloud.reportNote === "string") state.reportNote = cloud.reportNote;
     if(cloud.stages && Array.isArray(cloud.stages) && cloud.stages.length) state.stages = cloud.stages;
     if(cloud.contentLinks && typeof cloud.contentLinks === "object") state.contentLinks = cloud.contentLinks;
+    if(cloud.msgsSentManual && typeof cloud.msgsSentManual === "object") state.msgsSentManual = cloud.msgsSentManual;
     state.lastModified = cloudTime;
 
     if(typeof migrateProspectStages === "function") migrateProspectStages(state.prospects);
@@ -25511,9 +25547,7 @@ if(params.get("u") && params.get("pin")){
   var KEEPWARM_STAGES = ["loi"];
 
   function myProspectsList(){
-    return state.prospects.filter(function(p){
-      return state.user.role === "admin" || state.user.role === "viewer" || p.assignedTo === state.user.id;
-    });
+    return state.prospects.slice(); // shared team pipeline — everyone sees all
   }
 
   // Active-cadence touches that are due/overdue right now (excludes LOI, closed, etc.)
@@ -26561,12 +26595,14 @@ if(params.get("u") && params.get("pin")){
   }
 
   function normalizeOne(p){
-    if(!p || !p.cadence) return false;
-    var before = p.stage + "|" + p.cadence.templateId;
-    if(p.stage === "deep") p.stage = "engaged";                 // old Deeper Dive → Engaged (checklist)
-    else if(CANON.indexOf(p.stage) === -1) p.stage = "engaging"; // any other removed/custom stage → Engaging
-    if(p.stage === "engaged" && p.cadence.templateId !== "active-recruit") setPlaybook(p);
-    return (p.stage + "|" + p.cadence.templateId) !== before;
+    if(!p) return false;
+    var before = p.stage;
+    // Rescue prospects whose stage no longer maps to a column so they can
+    // never be orphaned (invisible) on the board. This ONLY relabels the
+    // stage onto a valid column. It NEVER touches the cadence template, so
+    // LinkedIn/outreach progress is never destroyed.
+    if(CANON.indexOf(p.stage) === -1) p.stage = "engaging"; // deep, branch-manager-pipeline, any legacy → Engaging
+    return p.stage !== before;
   }
   function normalizeAll(){
     var n = 0;
@@ -26615,14 +26651,10 @@ if(params.get("u") && params.get("pin")){
     };
   }
 
-  // Enforce on every save — whoever lands in Engaged picks up the checklist.
-  if(typeof window.persist === "function"){
-    var _persist = window.persist;
-    window.persist = function(){
-      try { normalizeAll(); } catch(e){ console.error("flow normalize", e); }
-      return _persist.apply(this, arguments);
-    };
-  }
+  // NOTE: the old every-save "normalizeAll()" hook was REMOVED. It force-switched
+  // every prospect sitting in Engaged onto Peter's Playbook on every single save,
+  // which wiped their LinkedIn/outreach cadence progress. Stage rescue now happens
+  // once on load (reconcileStages, below) and never switches templates.
 
   // Clean Kanban card for checklist prospects: current phase + phase progress.
   if(typeof window.kanbanCard === "function"){
@@ -26654,36 +26686,474 @@ if(params.get("u") && params.get("pin")){
     };
   }
 
-  // One-time: collapse to the 5 stages + fold stranded prospects, then re-render.
-  function migrateStages(){
-    try {
-      var already = false;
-      try { already = localStorage.getItem("pm_recruit_stages_v6") === "1"; } catch(e){}
-      var changed = normalizeAll() > 0;
-      if(!already){
+  // Is the board already the correct 6 stages, in order?
+  function stagesAreCanon(){
+    var s = state && state.stages;
+    if(!Array.isArray(s) || s.length !== CANON_STAGES.length) return false;
+    for(var i = 0; i < CANON_STAGES.length; i++){
+      if(!s[i] || s[i].id !== CANON_STAGES[i].id) return false;
+    }
+    return true;
+  }
+
+  // Reconcile the board to the correct 6 stages and rescue any prospect whose
+  // stage no longer maps to a column (so nothing is ever invisible). Runs only
+  // after the user is loaded (guards the null-user crash) and only WRITES when
+  // something actually needed fixing. NEVER switches cadence templates.
+  function reconcileStages(){
+    try{
+      if(!state || !state.user) return false;   // wait until signed in
+      var changed = false;
+      if(!stagesAreCanon()){
         state.stages = CANON_STAGES.map(function(s){ return { id:s.id, label:s.label }; });
-        try { localStorage.setItem("pm_recruit_stages_v6", "1"); } catch(e){}
         changed = true;
       }
+      (state.prospects || []).forEach(function(p){ if(normalizeOne(p)) changed = true; });
       if(changed){
         persist();
         if(typeof navigate === "function") navigate(state.screen, { replace:true });
       }
-      // Unstick any pre-existing New prospects into the auto-flow:
-      // already researched → assign now; otherwise queue research (which assigns on completion).
+      return true;
+    }catch(e){ console.error("reconcile stages", e); return false; }
+  }
+  window.__reconcileStages = reconcileStages;
+
+  // Also unstick brand-new prospects into the auto-research → cadence flow,
+  // once, after login. (Never assigns Peter's Playbook — bestFitCadence is bm/lo.)
+  function unstickNew(){
+    try{
       (state.prospects || []).forEach(function(p){
         if(!p || p.stage !== "new" || (p.cadence && p.cadence.startedAt)) return;
         if(p.research && !p.research.error){ autoAssignCadence(p); }
         else if(typeof queueAutoResearch === "function"){ queueAutoResearch(p); }
       });
-    } catch(e){ console.error("stage migrate", e); }
+    }catch(e){ console.error("unstick new", e); }
   }
-  // DISABLED: auto-migration on load was firing before the user loaded
-  // (state.user null → crash) and, combined with live sync, could push a
-  // partial dataset over a fuller one. Stages are already migrated; leaving
-  // this off. Can be run manually via window.__runStageMigration() if needed.
-  window.__runStageMigration = migrateStages;
-  // setTimeout(migrateStages, 700);
+
+  // Run when the user is ready. Poll briefly so we never read state.user when null.
+  (function schedule(){
+    var tries = 0;
+    var iv = setInterval(function(){
+      tries++;
+      if(state && state.user){
+        clearInterval(iv);
+        reconcileStages();
+        unstickNew();
+      } else if(tries > 60){ clearInterval(iv); } // ~30s cap, then give up quietly
+    }, 500);
+  })();
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — REPORT IMPORTER (PDF / image, preview-first)
+     Upload a report; Sonnet 5 extracts the people and their fields.
+     NOTHING is written until you review a preview and confirm. New
+     people are created through the normal path (auto-research fires);
+     existing people only get EMPTY fields filled — never overwritten.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+
+  function openReportImporter(){
+    var input = document.createElement("input");
+    input.type = "file";
+    input.accept = "application/pdf,image/png,image/jpeg,image/webp,text/plain,.txt";
+    input.onchange = function(){
+      var f = input.files && input.files[0];
+      if(!f) return;
+      var isPdf = /pdf/i.test(f.type) || /\.pdf$/i.test(f.name);
+      var isTxt = /text/i.test(f.type) || /\.txt$/i.test(f.name);
+      if(isPdf){
+        var ab = new FileReader();
+        ab.onload = function(){
+          extractPdfText(new Uint8Array(ab.result))
+            .then(function(text){
+              if(text && text.trim().length > 40){ runExtraction({ text:text }, f.name); }
+              else { sendPdfBinary(f); } // scanned / no text layer → fall back
+            })
+            .catch(function(err){ console.error("pdf text extract", err); sendPdfBinary(f); });
+        };
+        ab.readAsArrayBuffer(f);
+      } else if(isTxt){
+        var tr = new FileReader();
+        tr.onload = function(){ runExtraction({ text: String(tr.result) }, f.name); };
+        tr.readAsText(f);
+      } else {
+        var ir = new FileReader();
+        ir.onload = function(){ runExtraction({ image: { b64: String(ir.result).split(",")[1] || "", media: f.type || "image/png" } }, f.name); };
+        ir.readAsDataURL(f);
+      }
+    };
+    input.click();
+  }
+  window.openReportImporter = openReportImporter;
+
+  function sendPdfBinary(f){
+    var dr = new FileReader();
+    dr.onload = function(){ runExtraction({ pdfB64: String(dr.result).split(",")[1] || "" }, f.name); };
+    dr.readAsDataURL(f);
+  }
+
+  var _pdfjsPromise = null;
+  function loadPdfJs(){
+    if(window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+    if(_pdfjsPromise) return _pdfjsPromise;
+    _pdfjsPromise = new Promise(function(res, rej){
+      var s = document.createElement("script");
+      s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+      s.onload = function(){
+        try { window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js"; } catch(e){}
+        res(window.pdfjsLib);
+      };
+      s.onerror = function(){ rej(new Error("PDF reader failed to load (offline?)")); };
+      document.head.appendChild(s);
+    });
+    return _pdfjsPromise;
+  }
+  function extractPdfText(u8){
+    return loadPdfJs().then(function(lib){
+      return lib.getDocument({ data:u8 }).promise.then(function(pdf){
+        var pages = [], chain = Promise.resolve();
+        for(var i = 1; i <= pdf.numPages; i++){
+          (function(n){
+            chain = chain.then(function(){ return pdf.getPage(n); })
+                         .then(function(pg){ return pg.getTextContent(); })
+                         .then(function(tc){ pages.push(tc.items.map(function(it){ return it.str; }).join(" ")); });
+          })(i);
+        }
+        return chain.then(function(){ return pages.join("\n\n"); });
+      });
+    });
+  }
+
+  function parseJsonArray(text){
+    if(!text) return null;
+    var t = String(text).trim().replace(/^```json/i, "").replace(/^```/, "").replace(/```$/, "").trim();
+    var a = t.indexOf("["), z = t.lastIndexOf("]");
+    if(a === -1 || z === -1) return null;
+    try { return JSON.parse(t.slice(a, z + 1)); } catch(e){ return null; }
+  }
+
+  function extractionSystemPrompt(){
+    return "You extract recruit/producer records from a mortgage RECRUITING PIPELINE report and return ONLY a JSON array (no prose, no markdown fences).\n"
+      + "The report groups people into sections — map each person by the section they appear under:\n"
+      + "- HIRES (already hired, usually a month + a volume like 5M/10M) -> stageGuess \"closed\".\n"
+      + "- LOI OUT -> stageGuess \"loi\".\n"
+      + "- GREEN / YELLOW / RED (active pipeline, has a Monthly Volume and a Next Step) -> stageGuess \"engaged\", and set tier to \"Green\"/\"Yellow\"/\"Red\" for that section.\n"
+      + "A code in parentheses right after a name — (PS), (MP), (JM), (LP), (LB), (MZ), etc. — is the responsible recruiter's initials; put it in responsibleCode.\n"
+      + "Each element: {\"firstName\",\"lastName\",\"company\",\"monthlyVolume\"(dollars as a number or null),\"tier\"(Green|Yellow|Red|null),\"stageGuess\"(new|engaging|engaged|loi|closed|nurture),\"nextStep\"(string or null),\"responsibleCode\"(string or null),\"note\"(string or null)}.\n"
+      + "Convert money to plain numbers: \"$5,000,000\" -> 5000000; a hire volume like \"5M\" or \"10M\" -> 5000000 / 10000000; \"N/A\" -> null.\n"
+      + "Include EVERY named person across ALL sections. Use null for anything not present. Never invent data. If it is not a list of people, return [].";
+  }
+
+  function dedupeRecords(arr){
+    var order = { closed:5, loi:4, engaged:3, engaging:2, nurture:1, new:0 };
+    var MERGE = ["company","monthlyVolume","tier","nextStep","responsibleCode","note","position"];
+    var byName = {}, out = [];
+    arr.forEach(function(r){
+      var key = ((r.firstName || "") + "|" + (r.lastName || "")).toLowerCase().trim();
+      if(!key || key === "|"){ out.push(r); return; }
+      if(!byName[key]){ byName[key] = r; return; }
+      var cur = byName[key];
+      if((order[r.stageGuess] || 0) > (order[cur.stageGuess] || 0)){
+        MERGE.forEach(function(k){ if(r[k] == null || r[k] === "") r[k] = cur[k]; });
+        byName[key] = r;
+      } else {
+        MERGE.forEach(function(k){ if(cur[k] == null || cur[k] === "") cur[k] = r[k]; });
+      }
+    });
+    Object.keys(byName).forEach(function(k){ out.push(byName[k]); });
+    return out;
+  }
+
+  function runExtraction(payload, fname){
+    showModal("Reading report\u2026", function(modal, close){
+      modal.appendChild(e("p",{class:"muted",style:"line-height:1.5"}, "Reading \u201C" + fname + "\u201D \u2014 this can take a moment. Nothing will be saved until you review it."));
+      modal.appendChild(e("div",{class:"ri-spin",style:"margin:14px auto"}));
+
+      var opts = { model:"claude-sonnet-5", system: extractionSystemPrompt(), maxTokens:8000, label:"Report import: " + fname };
+      var call;
+      if(payload.text){
+        call = callAnthropic("Here is the report text. Extract every person as the JSON array described:\n\n" + payload.text, opts);
+      } else if(payload.image){
+        opts.content = [ { type:"image", source:{ type:"base64", media_type: payload.image.media, data: payload.image.b64 } }, { type:"text", text:"Extract every person in this report as the JSON array described." } ];
+        call = callAnthropic("", opts);
+      } else {
+        opts.content = [ { type:"document", source:{ type:"base64", media_type:"application/pdf", data: payload.pdfB64 } }, { type:"text", text:"Extract every person in this report as the JSON array described." } ];
+        call = callAnthropic("", opts);
+      }
+      call.then(function(out){
+        var arr = dedupeRecords(parseJsonArray(out) || []);
+        close();
+        if(!arr || !arr.length){ showToast("Couldn't find any people in that report."); return; }
+        showImportReview(arr, fname);
+      }).catch(function(err){
+        close(); console.error("report import", err);
+        showToast("Couldn't read the report \u2014 " + (err && err.message ? err.message : "check you're online") + ".");
+      });
+    });
+  }
+
+  function findExisting(rec){
+    var fn = (rec.firstName || "").toLowerCase().trim(), ln = (rec.lastName || "").toLowerCase().trim();
+    if(!fn && !ln) return null;
+    return (state.prospects || []).find(function(p){
+      return (p.firstName || "").toLowerCase().trim() === fn && (p.lastName || "").toLowerCase().trim() === ln;
+    }) || null;
+  }
+
+  function showImportReview(arr, fname){
+    showModal("Review import \u2014 " + arr.length + " found", function(modal, close){
+      modal.appendChild(e("p",{class:"muted",style:"line-height:1.5;margin-bottom:10px"},
+        "From \u201C" + fname + "\u201D. Nothing is saved until you click Import. Uncheck anyone you don't want. "
+        + "People already in your pipeline will be UPDATED (only blank fields filled \u2014 never overwritten); new people will be added and auto-researched."));
+      var rows = [];
+      var list = e("div",{class:"imp-list"});
+      arr.forEach(function(rec){
+        var existing = findExisting(rec);
+        var cb = e("input",{type:"checkbox"}); cb.checked = true;
+        var name = ((rec.firstName || "") + " " + (rec.lastName || "")).trim() || "(no name)";
+        var meta = [rec.company, rec.market].filter(Boolean).join(" \u00B7 ");
+        var row = e("label",{class:"imp-row"},
+          cb,
+          e("div",{class:"imp-main"},
+            e("div",{class:"imp-name"}, name, e("span",{class:"imp-tag " + (existing ? "upd" : "new")}, existing ? "update" : "new")),
+            e("div",{class:"imp-meta"}, meta || "\u2014")
+          )
+        );
+        rows.push({ rec:rec, cb:cb, existing:existing });
+        list.appendChild(row);
+      });
+      modal.appendChild(list);
+      var apply = e("button",{class:"btn", onClick:function(){
+        var picked = rows.filter(function(r){ return r.cb.checked; });
+        if(!picked.length){ showToast("Nothing selected"); return; }
+        close();
+        applyImport(picked);
+      }}, "Import selected");
+      modal.appendChild(e("div",{class:"modal-actions"}, apply, e("button",{class:"btn ghost", onClick:close}, "Cancel")));
+    });
+  }
+
+  function num(v){ var n = Number(String(v).replace(/[^0-9.]/g, "")); return isNaN(n) ? null : n; }
+
+  function applyImport(picked){
+    var created = 0, updated = 0;
+    var VALID = ["new","engaging","engaged","loi","closed","nurture"];
+    picked.forEach(function(r){
+      var rec = r.rec;
+      var tier = (["Green","Yellow","Red"].indexOf(rec.tier) !== -1) ? rec.tier : null;
+      if(r.existing){
+        var p = r.existing;
+        function fill(k, v){ if(v != null && v !== "" && (p[k] == null || p[k] === "" || p[k] === 0)) p[k] = v; }
+        fill("company", rec.company); fill("position", rec.position);
+        if(rec.monthlyVolume && !p.monthlyVolume) p.monthlyVolume = num(rec.monthlyVolume);
+        if(tier && !p.probability) p.probability = tier;
+        if(rec.nextStep && !p.nextStep) p.nextStep = rec.nextStep;
+        if(rec.responsibleCode && !p.responsibleParty) p.responsibleParty = rec.responsibleCode;
+        updated++;
+      } else {
+        var stage = VALID.indexOf(rec.stageGuess) !== -1 ? rec.stageGuess : "new";
+        var p2 = reportCreateProspect({
+          firstName: rec.firstName, lastName: rec.lastName, company: rec.company,
+          position: rec.position || "Loan Officer",
+          monthlyVolume: rec.monthlyVolume ? num(rec.monthlyVolume) : null,
+          stage: stage,
+          probability: tier,
+          nextStep: rec.nextStep || "",
+          recruiter: rec.responsibleCode || null
+        });
+        if(rec.note) p2.notes = rec.note;
+        created++;
+      }
+    });
+    persist();
+    if(typeof navigate === "function") navigate(state.screen, { replace:true });
+    showToast("Imported: " + created + " new, " + updated + " updated");
+  }
+
+  var st = document.createElement("style");
+  st.textContent = [
+    ".imp-list{display:flex;flex-direction:column;gap:2px;max-height:52vh;overflow:auto;margin:4px 0 6px}",
+    ".imp-row{display:flex;align-items:flex-start;gap:10px;padding:9px 8px;border-radius:8px;cursor:pointer}",
+    ".imp-row:hover{background:var(--surface-2,#f6f7f8)}",
+    ".imp-row input{margin-top:3px}",
+    ".imp-main{min-width:0}",
+    ".imp-name{font-weight:650;font-size:13.5px;color:var(--t-1);display:flex;align-items:center;gap:7px}",
+    ".imp-meta{font-size:11.5px;color:var(--t-3)}",
+    ".imp-tag{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:1px 7px;border-radius:999px}",
+    ".imp-tag.new{background:var(--brand-soft,#e6f2f3);color:var(--brand-2,#00818B)}",
+    ".imp-tag.upd{background:#fff4e0;color:#b45309}",
+    ".ri-spin{width:26px;height:26px;border-radius:50%;border:3px solid var(--brand-soft,#cde);border-top-color:var(--brand-2,#00818B);animation:riSpin .8s linear infinite}"
+  ].join("");
+  document.head.appendChild(st);
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — ONE-TAP RESTORE + DOWNLOAD BACKUP (no console)
+     A "Data & backup" card is added to Settings. Restore is
+     preview-first: it shows the counts and asks before replacing
+     anything. Restore only touches prospect DATA (never your users
+     or PINs), sets the shrink-guard override for this one write so
+     an intentional restore can go through, then repairs the stages.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+
+  var DATA_KEYS = ["prospects","activities","contentLinks","msgsSentManual","cadenceTemplates","videoLibrary","brandFacts","reportNote"];
+
+  function download(name, text){
+    try{
+      var blob = new Blob([text], { type:"application/json" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click();
+      setTimeout(function(){ document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
+    }catch(e){ console.error("backup download", e); if(typeof showToast==="function") showToast("Couldn't create the file"); }
+  }
+
+  function exportBackup(){
+    var out = {};
+    DATA_KEYS.forEach(function(k){ if(state[k] !== undefined) out[k] = state[k]; });
+    out.stages = state.stages;
+    out._backupAt = new Date().toISOString();
+    var stamp = new Date().toISOString().slice(0,19).replace(/[:T]/g,"-");
+    download("recruitos-backup-" + stamp + ".json", JSON.stringify(out));
+    if(typeof showToast === "function") showToast("Backup downloaded (" + ((state.prospects||[]).length) + " prospects)");
+  }
+  window.exportBackup = exportBackup;
+
+  function applyRestore(backup){
+    try{
+      DATA_KEYS.forEach(function(k){ if(backup[k] !== undefined) state[k] = backup[k]; });
+      // Intentional restore: allow this one write through the shrink-guard.
+      window._allowShrinkPush = true;
+      try { if(typeof window.__reconcileStages === "function") window.__reconcileStages(); } catch(e){}
+      if(typeof persist === "function") persist();
+      setTimeout(function(){ window._allowShrinkPush = false; }, 8000);
+      if(typeof navigate === "function") navigate(state.screen, { replace:true });
+      if(typeof showToast === "function") showToast("Restored " + ((state.prospects||[]).length) + " prospects");
+    }catch(e){ console.error("apply restore", e); if(typeof showToast==="function") showToast("Restore failed — nothing was changed"); }
+  }
+
+  function openRestoreBackup(){
+    var input = document.createElement("input");
+    input.type = "file"; input.accept = "application/json,.json";
+    input.onchange = function(){
+      var f = input.files && input.files[0];
+      if(!f) return;
+      var r = new FileReader();
+      r.onload = function(){
+        var backup;
+        try { backup = JSON.parse(String(r.result)); }
+        catch(e){ if(typeof showToast==="function") showToast("That file isn't a valid backup"); return; }
+        if(!backup || !Array.isArray(backup.prospects)){
+          if(typeof showToast==="function") showToast("That backup has no prospects in it"); return;
+        }
+        var nNew = backup.prospects.length;
+        var nNow = (state.prospects || []).length;
+        showModal("Restore from backup?", function(modal, close){
+          modal.appendChild(e("p",{style:"line-height:1.6;margin:0 0 10px"},
+            "This backup has ", e("b",{}, String(nNew) + " prospects"),
+            ". Your current data has ", e("b",{}, String(nNow) + " prospects"), "."
+          ));
+          modal.appendChild(e("p",{class:"muted",style:"line-height:1.6;margin:0 0 16px;font-size:13px"},
+            "Restoring replaces your current prospects and their activity/notes with the ones in this backup. Your sign-in and PINs are not touched. This is what you want if data went missing or got scrambled."
+          ));
+          var row = e("div",{style:"display:flex;gap:8px;justify-content:flex-end"});
+          row.appendChild(e("button",{class:"btn ghost", onClick:function(){ close(); }}, "Cancel"));
+          row.appendChild(e("button",{class:"btn", style:"background:var(--brand);color:#fff", onClick:function(){ close(); applyRestore(backup); }},
+            "Restore " + nNew + " prospects"));
+          modal.appendChild(row);
+        });
+      };
+      r.readAsText(f);
+    };
+    input.click();
+  }
+  window.openRestoreBackup = openRestoreBackup;
+
+  // Inject a "Data & backup" card into Settings.
+  if(typeof window.viewSettings === "function"){
+    var _vs = window.viewSettings;
+    window.viewSettings = function(){
+      var wrap = _vs.apply(this, arguments);
+      try{
+        var card = e("div",{class:"card",style:"margin-top:12px"});
+        card.appendChild(e("h3",{style:"margin:0 0 8px;font-size:14px"}, "Data & backup"));
+        card.appendChild(e("p",{class:"muted",style:"font-size:12.5px;margin:0 0 12px;line-height:1.55"},
+          "Download a backup any time so you always have a safe copy. If data ever goes missing or looks wrong, tap Restore and pick a backup file \u2014 no console needed. You currently have " +
+          ((state.prospects||[]).length) + " prospects."
+        ));
+        var row = e("div",{style:"display:flex;gap:8px;flex-wrap:wrap"});
+        row.appendChild(e("button",{class:"btn sm", onClick:function(){ exportBackup(); }}, "\u2193 Download backup"));
+        row.appendChild(e("button",{class:"btn sm", style:"background:var(--brand);color:#fff", onClick:function(){ openRestoreBackup(); }}, "\u21BB Restore from backup"));
+        card.appendChild(row);
+        wrap.appendChild(card);
+      }catch(e){ console.error("settings backup card", e); }
+      return wrap;
+    };
+  }
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — ROLES REMOVED (one shared pipeline for everyone)
+     Every signed-in user is treated as a full admin, so all the
+     scattered role checks pass for everyone. The separate Admin
+     screen is folded into the single Settings page and its nav
+     item is hidden. No PINs or view-only lockouts anymore.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+
+  // Coerce the signed-in user to admin before every render so every role
+  // check (canEdit, isAdmin, admin-only screens/sections) passes for everyone.
+  // Timing-independent and survives cloud refreshes.
+  function coerceAdmin(){
+    try { if(state && state.user && state.user.role !== "admin") state.user.role = "admin"; } catch(e){}
+  }
+  if(typeof window.render === "function"){
+    var _render = window.render;
+    window.render = function(){ coerceAdmin(); return _render.apply(this, arguments); };
+  }
+  coerceAdmin();
+
+  // Hide the standalone Admin nav entries — admin now lives inside Settings.
+  (function(){
+    var st = document.createElement("style");
+    st.textContent = "#rail-admin,#rail-admin-group,#gn-admin-btn{display:none !important;}";
+    document.head.appendChild(st);
+  })();
+
+  // Fold the Admin screen's contents into the single Settings page.
+  if(typeof window.viewSettings === "function"){
+    var _vs = window.viewSettings;
+    window.viewSettings = function(){
+      var wrap = _vs.apply(this, arguments);
+      try{
+        if(typeof viewAdmin === "function"){
+          var adminContent = viewAdmin(); // everyone is admin now → real content
+          if(adminContent){
+            wrap.appendChild(e("div",{class:"h-section",style:"margin-top:18px"}, e("div",{}, e("h2",{},"Team & admin"))));
+            var kids = Array.prototype.slice.call(adminContent.childNodes);
+            kids.forEach(function(node, idx){
+              // skip the admin screen's own "Admin" header to avoid a duplicate title
+              if(idx === 0 && node.classList && node.classList.contains("h-section")) return;
+              wrap.appendChild(node); // moves the node into Settings (handlers preserved)
+            });
+          }
+        }
+      }catch(e){ console.error("fold admin into settings", e); }
+      return wrap;
+    };
+  }
 })();
 </script>
 </body>
