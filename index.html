@@ -1375,11 +1375,16 @@ hr.div{border:0;border-top:1px solid var(--line);margin:14px 0}
   border-radius:var(--radius);
   display:flex;flex-direction:column;
   scroll-snap-align:start;
-  max-height:calc(100vh - 220px);
+  height:100%;max-height:calc(100vh - 150px);
   transition:background .15s, border-color .15s;
   box-shadow:var(--shadow);
 }
 @media(min-width:720px){.kanban-col{flex:0 0 260px;min-width:260px;max-width:260px}}
+/* Desktop: lock the board to a fixed region so columns scroll inside
+   themselves (uniform, aligned bottoms) instead of the whole page moving. */
+@media(min-width:720px){
+  .kanban-wrap{height:calc(100vh - 172px);overflow-y:hidden;align-items:stretch}
+}
 .kanban-col.drop-target{background:var(--brand-tint);border-color:var(--brand)}
 .kanban-col-head{
   padding:11px 12px;display:flex;align-items:center;justify-content:space-between;gap:8px;
@@ -15752,9 +15757,17 @@ async function syncFromCloudOnBoot(){
     state.stages = cloud.stages;
   }
 
+  // PROSPECTS MERGE by id (tombstone-aware): protects both directions —
+  // a device coming online neither loses teammates' additions nor bulldozes
+  // them with its own whole list.
+  const bootMerged = (typeof window.__rosMerge === "function")
+    ? window.__rosMerge(state.prospects || [], cloud.prospects || [], state.deletedIds || [], cloud.deletedIds || [])
+    : null;
+
   if(cloudTime > localTime){
     // Cloud is newer (likely another device updated). Apply.
-    state.prospects        = cloud.prospects        || [];
+    state.prospects        = bootMerged ? bootMerged.list : (cloud.prospects || []);
+    if(bootMerged) state.deletedIds = bootMerged.deleted;
     state.activities       = cloud.activities       || [];
     state.users            = cloud.users            || USERS.slice();
     state.cadenceTemplates = cloud.cadenceTemplates || null;
@@ -15768,12 +15781,21 @@ async function syncFromCloudOnBoot(){
     // someone on an old cached tab wrote prospects with "New Prospect" instead
     // of "new"). Idempotent — modern prospects pass through unchanged.
     migrateProspectStages(state.prospects);
+    if(typeof window.__rosCacheSync === "function") window.__rosCacheSync(state.prospects);
+    // If this device held records the cloud didn't, push the union back up.
+    if(bootMerged && bootMerged.localContributed){
+      state.lastModified = Date.now();
+      db.pushToCloud(stateToPersist());
+    }
     try{ localStorage.setItem(LS_KEY, JSON.stringify(stateToPersist())) }catch(e){}
     if(state.user) render();
     setCloudStatus("synced");
     if(localTime > 0) showToast("Updated from another device");
   } else if(localTime > cloudTime){
-    // Local is newer (e.g., research just saved, push was in flight). Push.
+    // Local is newer — but push the MERGED union, never just the local list,
+    // so prospects that only exist in the cloud aren't bulldozed.
+    if(bootMerged){ state.prospects = bootMerged.list; state.deletedIds = bootMerged.deleted; }
+    if(typeof window.__rosCacheSync === "function") window.__rosCacheSync(state.prospects);
     db.pushToCloud(stateToPersist());
   } else {
     // Already in sync.
@@ -15981,8 +16003,7 @@ function renderLoginUsers(){
   state.users.forEach((u)=>{
     const opt = document.createElement("option");
     opt.value = u.id;
-    const role = (u.role || "").replace(/^./, c => c.toUpperCase());
-    opt.textContent = u.name + (role ? "  \u00B7  " + role : "");
+    opt.textContent = u.name;
     sel.appendChild(opt);
   });
 }
@@ -21957,7 +21978,6 @@ function viewAdmin(){
         e("div",{style:"font-weight:500;font-size:14px"}, u.name),
         e("div",{class:"muted",style:"font-size:12px"}, `${u.email||""} · PIN: ${u.pin}`)
       ),
-      e("span",{class:"pill"}, u.role),
       e("button",{class:"btn sm subtle",onClick:()=>openUserModal(u)}, "Edit"),
       u.id !== state.user.id ? e("button",{class:"btn sm subtle",onClick:()=>{ uiConfirm("Remove "+u.name+"?", ()=>{ state.users = state.users.filter(x=>x.id!==u.id); persist(); navigate(state.screen,{replace:true}); }, { title:"Remove teammate", okLabel:"Remove", danger:true }); }}, "Remove") : null
     );
@@ -22335,19 +22355,17 @@ function renderCadenceSteps(tpl, mount){
   });
 }
 function openUserModal(existing){
-  const u = existing || { id:"u_"+uid(), name:"", email:"", pin:"", role:"recruiter" };
+  const u = existing || { id:"u_"+uid(), name:"", email:"", pin:"", role:"admin" };
   showModal(`${existing?"Edit":"Add"} user`, (modal,close)=>{
     const grid = e("div",{class:"form-grid"});
     const nameI = e("input",{value:u.name,placeholder:"Full name"}); grid.appendChild(e("div",{},e("label",{},"Name"),nameI));
     const emailI= e("input",{value:u.email||"",placeholder:"email@partnersmortgage.com"}); grid.appendChild(e("div",{},e("label",{},"Email"),emailI));
     const pinI  = e("input",{value:u.pin,maxlength:6,placeholder:"4-6 digit PIN",inputmode:"numeric",pattern:"[0-9]*"}); grid.appendChild(e("div",{},e("label",{},"PIN"),pinI));
-    const roleS = e("select",{}); ["admin","recruiter","viewer"].forEach(r=>{const o=e("option",{value:r},r); if(u.role===r) o.selected=true; roleS.appendChild(o)});
-    grid.appendChild(e("div",{},e("label",{},"Role"),roleS));
     modal.appendChild(grid);
     modal.appendChild(e("div",{class:"modal-actions"},
       e("button",{class:"btn ghost",onClick:close},"Cancel"),
       e("button",{class:"btn",onClick:()=>{
-        u.name=nameI.value.trim(); u.email=emailI.value.trim(); u.pin=pinI.value.trim(); u.role=roleS.value;
+        u.name=nameI.value.trim(); u.email=emailI.value.trim(); u.pin=pinI.value.trim(); u.role="admin";
         if(!u.name||!u.pin) return showToast("Name and PIN required");
         if(!existing) state.users.push(u);
         persist(); close(); navigate(state.screen,{replace:true}); showToast("Saved");
@@ -25210,8 +25228,6 @@ if(params.get("u") && params.get("pin")){
     var incomingReal = incoming.some(function(p){ return p && !p._seed; });
     var localReal = state.prospects && state.prospects.some(function(p){ return p && !p._seed; });
     // SAFETY: never let an empty OR sample-only cloud snapshot wipe a populated pipeline.
-    // If we hold real data and the cloud came back empty/sample-only, OUR copy is the
-    // good one — push it back up to repair the cloud and stop the wipe from spreading.
     if(!incomingReal && localReal){
       console.warn("[cloud] ignored an empty/sample-only prospects update — re-pushing local data to restore the cloud");
       state.lastModified = Date.now();
@@ -25219,17 +25235,34 @@ if(params.get("u") && params.get("pin")){
       if(typeof setCloudStatus === "function") setCloudStatus("synced");
       return;
     }
-    state.prospects        = incoming;
-    state.activities       = cloud.activities       || [];
-    state.users            = cloud.users            || (typeof USERS !== "undefined" ? USERS.slice() : state.users);
-    state.cadenceTemplates = cloud.cadenceTemplates || null;
-    state.videoLibrary     = cloud.videoLibrary     || [];
-    state.brandFacts       = (typeof cloud.brandFacts === "string") ? cloud.brandFacts : null;
-    if(typeof cloud.reportNote === "string") state.reportNote = cloud.reportNote;
-    if(cloud.stages && Array.isArray(cloud.stages) && cloud.stages.length) state.stages = cloud.stages;
-    if(cloud.contentLinks && typeof cloud.contentLinks === "object") state.contentLinks = cloud.contentLinks;
-    if(cloud.msgsSentManual && typeof cloud.msgsSentManual === "object") state.msgsSentManual = cloud.msgsSentManual;
-    state.lastModified = cloudTime;
+    var newer = cloudTime > (state.lastModified || 0);
+    // PROSPECTS MERGE by id — a teammate's additions land even if this device
+    // has "newer" unrelated edits, and this device's records are never dropped
+    // by a whole-list replace. Deletions travel as tombstones.
+    var merged = (typeof window.__rosMerge === "function")
+      ? window.__rosMerge(state.prospects || [], incoming, state.deletedIds || [], cloud.deletedIds || [])
+      : null;
+    state.prospects = merged ? merged.list : incoming;
+    if(merged) state.deletedIds = merged.deleted;
+    if(newer){
+      state.activities       = cloud.activities       || [];
+      state.users            = cloud.users            || (typeof USERS !== "undefined" ? USERS.slice() : state.users);
+      state.cadenceTemplates = cloud.cadenceTemplates || null;
+      state.videoLibrary     = cloud.videoLibrary     || [];
+      state.brandFacts       = (typeof cloud.brandFacts === "string") ? cloud.brandFacts : null;
+      if(typeof cloud.reportNote === "string") state.reportNote = cloud.reportNote;
+      if(cloud.stages && Array.isArray(cloud.stages) && cloud.stages.length) state.stages = cloud.stages;
+      if(cloud.contentLinks && typeof cloud.contentLinks === "object") state.contentLinks = cloud.contentLinks;
+      if(cloud.msgsSentManual && typeof cloud.msgsSentManual === "object") state.msgsSentManual = cloud.msgsSentManual;
+      state.lastModified = cloudTime;
+    }
+    if(typeof window.__rosCacheSync === "function") window.__rosCacheSync(state.prospects);
+    // If this device held records/deletions the cloud didn't, push the merged
+    // result back so every device converges on the union.
+    if(merged && merged.localContributed){
+      state.lastModified = Date.now();
+      try { db.pushToCloud(stateToPersist()); } catch(e){}
+    }
 
     if(typeof migrateProspectStages === "function") migrateProspectStages(state.prospects);
     if(typeof ensureReportingFields === "function") state.prospects.forEach(ensureReportingFields);
@@ -25254,6 +25287,7 @@ if(params.get("u") && params.get("pin")){
       showToast("Updated from another teammate");
     }
   }
+  window.__applyCloud = maybeApply;
 
   // Flush a deferred update once the user stops editing.
   setInterval(function(){
@@ -25275,10 +25309,12 @@ if(params.get("u") && params.get("pin")){
         if(!snap || !snap.exists || !snap.exists()) { firstSnap = false; return; }
         const cloud = snap.data() || {};
         const cloudTime = cloud.lastModified || cloud._updatedAt || 0;
-        // Only apply when the cloud is genuinely newer than what we hold.
-        // Our own writes echo back with cloudTime === state.lastModified and are skipped,
-        // so there's no feedback loop.
-        if(cloudTime > (state.lastModified || 0)){
+        // Apply whenever the snapshot differs from what we hold. Older-stamped
+        // snapshots are safe now: prospects go through the id-merge (so a
+        // teammate's additions land even when this device is "newer"), and
+        // wholesale fields are only replaced when the cloud is newer.
+        // Our own writes echo back with cloudTime === state.lastModified and are skipped.
+        if(cloudTime && cloudTime !== (state.lastModified || 0)){
           maybeApply(cloud, cloudTime);
         }
         firstSnap = false;
@@ -25465,6 +25501,8 @@ if(params.get("u") && params.get("pin")){
           if(typeof data.brandFacts === "string") state.brandFacts = data.brandFacts;
           if(typeof data.reportNote === "string") state.reportNote = data.reportNote;
           state.lastModified = Date.now();
+          window._allowShrinkPush = true; // intentional replace — let it through the shrink-guard
+          setTimeout(function(){ window._allowShrinkPush = false; }, 8000);
           if(state.user){ const me = state.users.find(function(u){ return u.id === state.user.id; }); if(me) state.user = me; }
           try { localStorage.setItem(LS_KEY, JSON.stringify(stateToPersist())); } catch(e){}
           try {
@@ -26597,11 +26635,11 @@ if(params.get("u") && params.get("pin")){
   function normalizeOne(p){
     if(!p) return false;
     var before = p.stage;
-    // Rescue prospects whose stage no longer maps to a column so they can
-    // never be orphaned (invisible) on the board. This ONLY relabels the
-    // stage onto a valid column. It NEVER touches the cadence template, so
-    // LinkedIn/outreach progress is never destroyed.
-    if(CANON.indexOf(p.stage) === -1) p.stage = "engaging"; // deep, branch-manager-pipeline, any legacy → Engaging
+    // Rescue ONLY prospects whose stage doesn't exist on the current board
+    // (including custom columns). Relabels stage; NEVER touches the cadence
+    // template, so LinkedIn/outreach progress is never destroyed.
+    var ids = currentStageIds();
+    if(ids.indexOf(p.stage) === -1) p.stage = (ids.indexOf("engaging") !== -1 ? "engaging" : ids[0]);
     return p.stage !== before;
   }
   function normalizeAll(){
@@ -26686,29 +26724,32 @@ if(params.get("u") && params.get("pin")){
     };
   }
 
-  // Is the board already the correct 6 stages, in order?
-  function stagesAreCanon(){
-    var s = state && state.stages;
-    if(!Array.isArray(s) || s.length !== CANON_STAGES.length) return false;
-    for(var i = 0; i < CANON_STAGES.length; i++){
-      if(!s[i] || s[i].id !== CANON_STAGES[i].id) return false;
-    }
-    return true;
+  // Stage ids from the old broken board that must be migrated away.
+  var LEGACY_IDS = ["branch-manager-pipeline", "deep"];
+
+  function currentStageIds(){
+    var s = (state && Array.isArray(state.stages) && state.stages.length) ? state.stages : CANON_STAGES;
+    return s.map(function(x){ return x.id; });
   }
 
-  // Reconcile the board to the correct 6 stages and rescue any prospect whose
-  // stage no longer maps to a column (so nothing is ever invisible). Runs only
-  // after the user is loaded (guards the null-user crash) and only WRITES when
-  // something actually needed fixing. NEVER switches cadence templates.
+  // Reconcile runs after login. It ONLY rebuilds the stage list when the list
+  // is missing or still contains legacy ids from the old board. A customized
+  // list (extra columns, renames, reorders) is the user's choice and is left
+  // alone. Orphaned prospects are rescued into a column that actually exists.
   function reconcileStages(){
     try{
       if(!state || !state.user) return false;   // wait until signed in
       var changed = false;
-      if(!stagesAreCanon()){
+      var hasLegacy = Array.isArray(state.stages) && state.stages.some(function(s){ return s && LEGACY_IDS.indexOf(s.id) !== -1; });
+      if(!Array.isArray(state.stages) || !state.stages.length || hasLegacy){
         state.stages = CANON_STAGES.map(function(s){ return { id:s.id, label:s.label }; });
         changed = true;
       }
-      (state.prospects || []).forEach(function(p){ if(normalizeOne(p)) changed = true; });
+      var ids = currentStageIds();
+      var fallback = ids.indexOf("engaging") !== -1 ? "engaging" : ids[0];
+      (state.prospects || []).forEach(function(p){
+        if(p && ids.indexOf(p.stage) === -1){ p.stage = fallback; changed = true; }
+      });
       if(changed){
         persist();
         if(typeof navigate === "function") navigate(state.screen, { replace:true });
@@ -27084,6 +27125,12 @@ if(params.get("u") && params.get("pin")){
     window.viewSettings = function(){
       var wrap = _vs.apply(this, arguments);
       try{
+        // Consolidation: retire the older "Backup & transfer" card — its job is
+        // fully covered by this Data & backup card (and its import path didn't
+        // account for the shrink-guard). One backup card, one place.
+        Array.prototype.slice.call(wrap.querySelectorAll("h3")).forEach(function(h){
+          if(h.textContent === "Backup & transfer" && h.parentNode) h.parentNode.remove();
+        });
         var card = e("div",{class:"card",style:"margin-top:12px"});
         card.appendChild(e("h3",{style:"margin:0 0 8px;font-size:14px"}, "Data & backup"));
         card.appendChild(e("p",{class:"muted",style:"font-size:12.5px;margin:0 0 12px;line-height:1.55"},
@@ -27141,7 +27188,12 @@ if(params.get("u") && params.get("pin")){
         if(typeof viewAdmin === "function"){
           var adminContent = viewAdmin(); // everyone is admin now → real content
           if(adminContent){
-            wrap.appendChild(e("div",{class:"h-section",style:"margin-top:18px"}, e("div",{}, e("h2",{},"Team & admin"))));
+            wrap.appendChild(e("div",{class:"h-section",style:"margin-top:18px"},
+              e("div",{}, e("h2",{},"Team & admin")),
+              e("div",{class:"actions"},
+                e("button",{class:"btn sm",onClick:function(){ if(typeof openUserModal === "function") openUserModal(); }}, "+ Add user")
+              )
+            ));
             var kids = Array.prototype.slice.call(adminContent.childNodes);
             kids.forEach(function(node, idx){
               // skip the admin screen's own "Admin" header to avoid a duplicate title
@@ -27154,6 +27206,231 @@ if(params.get("u") && params.get("pin")){
       return wrap;
     };
   }
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — POLISH & MOTION LAYER
+     One coherent motion system across the app:
+     · screens fade/rise in on navigation
+     · modals scale in with a soft backdrop fade
+     · toasts slide up and settle
+     · cards lift on hover, press down on click
+     · kanban drags tilt slightly; drop targets glow
+     · progress bars ease to their value
+     · list rows cascade in subtly
+     Respects prefers-reduced-motion (everything collapses to
+     instant, so accessibility settings are honored).
+     ============================================================ -->
+<style>
+  :root{
+    --ease-out: cubic-bezier(.22,.9,.3,1);
+    --ease-spring: cubic-bezier(.34,1.4,.44,1);
+  }
+
+  /* --- screen transitions: each rendered screen rises in --- */
+  @keyframes ros-screen-in{
+    from{ opacity:0; transform:translateY(6px); }
+    to{ opacity:1; transform:none; }
+  }
+  .screen{ animation: ros-screen-in .28s var(--ease-out) both; }
+
+  /* --- subtle cascade for the first rows/cards of a screen --- */
+  @keyframes ros-rise{
+    from{ opacity:0; transform:translateY(5px); }
+    to{ opacity:1; transform:none; }
+  }
+  .screen > .card, .screen > .h-section{ animation: ros-rise .3s var(--ease-out) both; }
+  .screen > .card:nth-of-type(2){ animation-delay:.04s; }
+  .screen > .card:nth-of-type(3){ animation-delay:.08s; }
+  .screen > .card:nth-of-type(4){ animation-delay:.12s; }
+
+  /* --- modals: soft backdrop + panel scales in (app uses #modal-bg.show > #modal) --- */
+  #modal-bg{ transition: opacity .18s ease-out; }
+  @keyframes ros-modal-in{
+    from{ opacity:0; transform:scale(.965) translateY(8px); }
+    to{ opacity:1; transform:none; }
+  }
+  #modal-bg.show #modal{ animation: ros-modal-in .24s var(--ease-spring) both; }
+
+  /* --- toast: slide up, settle (preserves the app's translateX centering) --- */
+  #toast{ transition: opacity .22s var(--ease-out), transform .28s var(--ease-spring); }
+  #toast:not(.show){ opacity:0; transform:translateX(-50%) translateY(12px) scale(.98); }
+  #toast.show{ opacity:1; transform:translateX(-50%) translateY(0); }
+
+  /* --- cards: lift on hover, press on click --- */
+  .k-card{ will-change: transform; }
+  .k-card:hover{ transform:translateY(-1px); box-shadow:0 8px 20px -14px rgba(13,61,66,.45); }
+  .k-card:active{ transform:translateY(0) scale(.985); }
+  .card{ transition: box-shadow .2s var(--ease-out), transform .2s var(--ease-out); }
+
+  /* --- buttons: tactile press everywhere --- */
+  .btn{ transition: transform .12s var(--ease-out), background .15s, color .15s, border-color .15s, box-shadow .15s; }
+  .btn:hover{ transform:translateY(-1px); }
+  .btn:active{ transform:translateY(0) scale(.97); }
+
+  /* --- kanban drag & drop feedback --- */
+  .k-card.dragging{ opacity:.85; transform:rotate(1.6deg) scale(1.02); box-shadow:0 14px 30px -12px rgba(13,61,66,.5); }
+  .kanban-col.drop-target{ box-shadow:0 0 0 2px var(--stage, var(--brand)) inset; transition: box-shadow .15s var(--ease-out); }
+  .kanban-col{ transition: box-shadow .18s var(--ease-out), background .15s, border-color .15s; }
+
+  /* --- progress bars ease to their value --- */
+  .kc-prog > *, .progress > *, [class*="prog-fill"]{ transition: width .5s var(--ease-out); }
+
+  /* --- nav/tab underline + active state glide --- */
+  .pd-tab, [data-screen]{ transition: color .15s, background .15s, border-color .15s; }
+
+  /* --- inputs: focus ring eases in --- */
+  input, select, textarea{ transition: border-color .15s, box-shadow .18s var(--ease-out); }
+
+  /* --- research indicator: gentle pulse so it reads as "working" --- */
+  @keyframes ros-pulse{ 0%,100%{ opacity:1; } 50%{ opacity:.55; } }
+  #research-indicator .dot, .ri-spin{ animation-timing-function: ease-in-out; }
+
+  /* --- accessibility: honor reduced motion fully --- */
+  @media (prefers-reduced-motion: reduce){
+    *, *::before, *::after{
+      animation-duration:.001s !important;
+      animation-delay:0s !important;
+      transition-duration:.001s !important;
+      scroll-behavior:auto !important;
+    }
+  }
+</style>
+<script>
+(function(){
+  "use strict";
+  // Tag kanban cards while dragging so the tilt style applies, regardless of
+  // which drag implementation fires (HTML5 or pointer-based).
+  document.addEventListener("dragstart", function(ev){
+    var card = ev.target && ev.target.closest ? ev.target.closest(".k-card") : null;
+    if(card) card.classList.add("dragging");
+  }, true);
+  document.addEventListener("dragend", function(ev){
+    var card = ev.target && ev.target.closest ? ev.target.closest(".k-card") : null;
+    if(card) card.classList.remove("dragging");
+    document.querySelectorAll(".k-card.dragging").forEach(function(c){ c.classList.remove("dragging"); });
+  }, true);
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — SYNC MERGE ENGINE + WAKE RE-PULL
+     Fixes teammates not seeing each other's changes promptly:
+     · Every locally-changed prospect gets a per-record revision
+       stamp (_rev) at save time.
+     · Cloud updates MERGE prospects by id (newer _rev wins per
+       record) instead of replacing the whole list — so one
+       device's unrelated edits can no longer hide or drop a
+       teammate's new prospect.
+     · Deletions travel as tombstones (state.deletedIds) so a
+       deleted prospect can't resurrect from another device.
+     · When the app wakes (phone unlocked, tab refocused, back
+       online) it immediately re-pulls from the cloud instead of
+       waiting for the suspended live connection to recover.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+
+  /* ---------- per-record revision stamping ---------- */
+  var _seen = {};   // id -> JSON of the record (minus _rev) at last save/sync
+
+  function keyOf(p){
+    if(!p) return "";
+    var c = {}; for(var k in p){ if(k !== "_rev") c[k] = p[k]; }
+    try { return JSON.stringify(c); } catch(e){ return ""; }
+  }
+  function cacheSync(list){
+    _seen = {};
+    (list || []).forEach(function(p){ if(p && p.id) _seen[p.id] = keyOf(p); });
+  }
+  window.__rosCacheSync = cacheSync;
+  cacheSync(typeof state !== "undefined" ? state.prospects : []);
+
+  function stampChanged(){
+    try{
+      (state.prospects || []).forEach(function(p){
+        if(!p || !p.id) return;
+        var k = keyOf(p);
+        if(_seen[p.id] !== k){ p._rev = Date.now(); _seen[p.id] = k; }
+      });
+    }catch(e){}
+  }
+  if(typeof window.persist === "function"){
+    var _persist = window.persist;
+    window.persist = function(){ stampChanged(); return _persist.apply(this, arguments); };
+  }
+
+  /* ---------- deletion tombstones ---------- */
+  if(typeof window.stateToPersist === "function"){
+    var _stp = window.stateToPersist;
+    window.stateToPersist = function(){
+      var out = _stp.apply(this, arguments);
+      out.deletedIds = (state.deletedIds || []).slice(-500); // cap growth
+      return out;
+    };
+  }
+  if(typeof window.deleteProspect === "function"){
+    var _del = window.deleteProspect;
+    window.deleteProspect = function(prospectId){
+      try{
+        state.deletedIds = state.deletedIds || [];
+        if(prospectId && state.deletedIds.indexOf(prospectId) === -1) state.deletedIds.push(prospectId);
+        delete _seen[prospectId];
+      }catch(e){}
+      return _del.apply(this, arguments);
+    };
+  }
+
+  /* ---------- the merge ---------- */
+  // Returns { list, deleted, localContributed }.
+  // localContributed = this device held records/deletions the cloud lacked,
+  // so the caller should push the union back up to converge everyone.
+  window.__rosMerge = function(localArr, cloudArr, localDel, cloudDel){
+    localArr = localArr || []; cloudArr = cloudArr || [];
+    var del = {};
+    (cloudDel || []).forEach(function(id){ if(id) del[id] = true; });
+    var localOnlyDel = false;
+    (localDel || []).forEach(function(id){ if(id){ if(!del[id]) localOnlyDel = true; del[id] = true; } });
+
+    var byId = {}, order = [];
+    cloudArr.forEach(function(p){
+      if(!p || !p.id || del[p.id]) return;
+      byId[p.id] = p; order.push(p.id);
+    });
+    var contributed = localOnlyDel;
+    localArr.forEach(function(p){
+      if(!p || !p.id || del[p.id]) return;
+      var c = byId[p.id];
+      if(!c){ byId[p.id] = p; order.push(p.id); contributed = true; }
+      else if((p._rev || 0) > (c._rev || 0)){ byId[p.id] = p; contributed = true; }
+    });
+    return {
+      list: order.map(function(id){ return byId[id]; }),
+      deleted: Object.keys(del),
+      localContributed: contributed
+    };
+  };
+
+  /* ---------- wake re-pull (phone unlock / refocus / back online) ---------- */
+  var _lastPull = 0;
+  function wakePull(){
+    var now = Date.now();
+    if(now - _lastPull < 5000) return;   // throttle
+    _lastPull = now;
+    try{
+      if(window.db && typeof db.pullFromCloud === "function" && typeof window.__applyCloud === "function"){
+        db.pullFromCloud().then(function(cloud){
+          if(cloud) window.__applyCloud(cloud, cloud.lastModified || cloud._updatedAt || 0);
+        }).catch(function(){});
+      }
+    }catch(e){}
+  }
+  document.addEventListener("visibilitychange", function(){ if(document.visibilityState === "visible") wakePull(); });
+  window.addEventListener("pageshow", wakePull);
+  window.addEventListener("online", wakePull);
+  window.addEventListener("focus", wakePull);
 })();
 </script>
 </body>
