@@ -16674,7 +16674,13 @@ function renderKanban(arr){
     col.setAttribute("data-stage", stage);
     col.appendChild(e("div",{class:"kanban-col-head"},
       e("div",{class:"kc-name"}, stageObj.label),
-      e("div",{class:"kc-count"}, String(items.length))
+      e("div",{style:"display:flex;align-items:center;gap:6px"},
+        e("button",{class:"kc-export",title:"Export this column for leadership",onClick:(ev)=>{
+          ev.stopPropagation();
+          if(typeof window.exportStageReport === "function") window.exportStageReport(stage, stageObj.label);
+        }},"\u2913"),
+        e("div",{class:"kc-count"}, String(items.length))
+      )
     ));
     const colBody = e("div",{class:"kanban-col-body"});
     if(!items.length){
@@ -18212,7 +18218,7 @@ async function runResearch(p, opts = {}){
     const userPrompt = buildResearchPrompt(p);
     rawText = await callAnthropic(userPrompt, {
       label: `Research: ${p.firstName} ${p.lastName}`,
-      model: "claude-sonnet-5",
+      model: CONFIG.anthropicModel,
       system: RESEARCH_SYSTEM_PROMPT + voicePromptSegment(state.user),
       maxTokens: 8192,
       tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }],
@@ -20817,6 +20823,15 @@ async function callAnthropic(userPrompt, opts = {}){
     const errText = await r.text();
     let msg = `HTTP ${r.status}`;
     try { const ej = JSON.parse(errText); msg = ej.error?.message || msg; } catch(e){}
+    // SELF-HEAL: if the failure is an unknown/invalid model (bad saved setting,
+    // stale build), retry ONCE with the known-good default instead of failing
+    // the whole feature.
+    if(!opts._retriedModel && (r.status === 400 || r.status === 404) && /model/i.test(msg) && body.model !== "claude-sonnet-4-6"){
+      aiLogUpdate(entry, { phase:"retrying", error:"Invalid model \"" + body.model + "\" — retrying with claude-sonnet-4-6" });
+      if(opts.onProgress) opts.onProgress(entry);
+      try { if(CONFIG.anthropicModel === body.model) CONFIG.anthropicModel = "claude-sonnet-4-6"; } catch(e){}
+      return callAnthropic(userPrompt, Object.assign({}, opts, { model:"claude-sonnet-4-6", _retriedModel:true }));
+    }
     aiLogUpdate(entry, { status:"error", phase:"error", error: msg, responsePreview: errText.slice(0,500) });
     if(opts.onProgress) opts.onProgress(entry);
     throw new Error(msg);
@@ -21478,7 +21493,7 @@ function viewSettings(){
   aiCard.appendChild(e("label",{style:"font-size:12px;color:var(--t-2);display:block;margin:0 0 4px"},"Model"));
   const modelSelect = e("select",{},
     e("option",{value:"claude-sonnet-4-6"}, "Claude Sonnet 4.6 — recommended"),
-    e("option",{value:"claude-opus-4-7"},   "Claude Opus 4.7 — slowest, most capable"),
+    e("option",{value:"claude-opus-4-8"},   "Claude Opus 4.8 — slowest, most capable"),
     e("option",{value:"claude-haiku-4-5"},  "Claude Haiku 4.5 — fastest, cheapest")
   );
   modelSelect.value = CONFIG.anthropicModel;
@@ -26914,7 +26929,7 @@ if(params.get("u") && params.get("pin")){
       modal.appendChild(e("p",{class:"muted",style:"line-height:1.5"}, "Reading \u201C" + fname + "\u201D \u2014 this can take a moment. Nothing will be saved until you review it."));
       modal.appendChild(e("div",{class:"ri-spin",style:"margin:14px auto"}));
 
-      var opts = { model:"claude-sonnet-5", system: extractionSystemPrompt(), maxTokens:8000, label:"Report import: " + fname };
+      var opts = { model: CONFIG.anthropicModel, system: extractionSystemPrompt(), maxTokens:8000, label:"Report import: " + fname };
       var call;
       if(payload.text){
         call = callAnthropic("Here is the report text. Extract every person as the JSON array described:\n\n" + payload.text, opts);
@@ -27431,6 +27446,151 @@ if(params.get("u") && params.get("pin")){
   window.addEventListener("pageshow", wakePull);
   window.addEventListener("online", wakePull);
   window.addEventListener("focus", wakePull);
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — LEADERSHIP STAGE EXPORT
+     Each pipeline column has an export (⤓) button that opens a
+     clean, branded, print-ready report of that column: name,
+     company, position, NMLS, completed outreach steps (with
+     dates), and notes. One click to Print / Save as PDF —
+     presentable enough to go straight to the president.
+     ============================================================ -->
+<style>
+  .kc-export{
+    background:none;border:1px solid var(--line);border-radius:7px;
+    width:24px;height:24px;line-height:1;font-size:13px;color:var(--t-2);
+    cursor:pointer;display:flex;align-items:center;justify-content:center;
+    transition:all .15s;
+  }
+  .kc-export:hover{ color:var(--brand); border-color:var(--brand); background:var(--brand-tint,rgba(0,129,139,.06)); transform:none; }
+</style>
+<script>
+(function(){
+  "use strict";
+
+  function esc(s){
+    return String(s == null ? "" : s)
+      .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
+  function fmtDate(ts){
+    try { return new Date(ts).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}); }
+    catch(e){ return ""; }
+  }
+  function money(n){
+    if(n == null || isNaN(n)) return "";
+    return "$" + Number(n).toLocaleString("en-US");
+  }
+
+  function completedSteps(p){
+    // -> [{label, when}] sorted by completion time
+    var out = [];
+    try{
+      if(typeof ensureCadence === "function") ensureCadence(p);
+      var tpl = (typeof getTemplate === "function") ? getTemplate(p) : null;
+      var steps = (tpl && tpl.steps) || [];
+      var byId = {}; steps.forEach(function(s){ byId[s.id] = s; });
+      ((p.cadence && p.cadence.completed) || []).forEach(function(c){
+        var s = byId[c.stepId];
+        if(!s) return;
+        var label = s.action || s.short || c.stepId;
+        if(c.taskId && s.tasks){
+          var t = s.tasks.find ? s.tasks.find(function(x){ return x.id === c.taskId; }) : null;
+          if(t) label = (s.short || s.action) + " — " + t.label;
+        }
+        out.push({ label: label, when: c.completedAt || 0 });
+      });
+    }catch(e){}
+    out.sort(function(a,b){ return a.when - b.when; });
+    return out;
+  }
+
+  function prospectBlock(p){
+    var name = esc(((p.firstName||"") + " " + (p.lastName||"")).trim() || "Unnamed prospect");
+    var subBits = [];
+    if(p.company)  subBits.push(esc(p.company));
+    if(p.position) subBits.push(esc(p.position));
+    var sub = subBits.join(" &middot; ");
+    var facts = [];
+    if(p.nmls) facts.push("<span><b>NMLS</b> " + esc(p.nmls) + "</span>");
+    if(p.monthlyVolume) facts.push("<span><b>Monthly volume</b> " + money(p.monthlyVolume) + "</span>");
+    if(p.market) facts.push("<span><b>Market</b> " + esc(p.market) + "</span>");
+
+    var steps = completedSteps(p);
+    var stepsHtml = steps.length
+      ? "<ol class='steps'>" + steps.map(function(s){
+          return "<li>" + esc(s.label) + (s.when ? "<span class='when'>" + fmtDate(s.when) + "</span>" : "") + "</li>";
+        }).join("") + "</ol>"
+      : "<div class='none'>No outreach steps completed yet.</div>";
+
+    var notesHtml = (p.notes && String(p.notes).trim())
+      ? "<div class='notes'><div class='nlabel'>Notes</div>" + esc(p.notes).replace(/\n/g,"<br>") + "</div>"
+      : "";
+
+    return "<section class='prospect'>"
+      + "<div class='p-head'><div><div class='p-name'>" + name + "</div>"
+      + (sub ? "<div class='p-sub'>" + sub + "</div>" : "") + "</div></div>"
+      + (facts.length ? "<div class='facts'>" + facts.join("") + "</div>" : "")
+      + "<div class='slabel'>Steps taken</div>" + stepsHtml
+      + notesHtml
+      + "</section>";
+  }
+
+  window.exportStageReport = function(stageId, stageLabel){
+    var people = (state.prospects || []).filter(function(p){ return p && p.stage === stageId; });
+    if(!people.length){ if(typeof showToast === "function") showToast("No prospects in " + stageLabel + " to export"); return; }
+    // Order by volume (largest first) so leadership sees the headline names first.
+    people = people.slice().sort(function(a,b){ return (b.monthlyVolume||0) - (a.monthlyVolume||0); });
+
+    var totalVol = people.reduce(function(s,p){ return s + (Number(p.monthlyVolume)||0); }, 0);
+    var today = new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
+    var preparedBy = (state.user && state.user.name) ? esc(state.user.name) : "Recruiting Team";
+
+    var html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+      + "<title>Recruiting Pipeline — " + esc(stageLabel) + "</title>"
+      + "<style>"
+      + ":root{--teal:#00818B;--gold:#FFAC27;--ink:#0F1416;--line:#e5e8ea;--muted:#5b6670;}"
+      + "*{box-sizing:border-box;margin:0;padding:0}"
+      + "body{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;color:var(--ink);background:#fff;padding:48px 56px;max-width:860px;margin:0 auto;line-height:1.5}"
+      + ".band{border-top:6px solid var(--teal);padding-top:26px;margin-bottom:6px}"
+      + ".wordmark{font-size:12px;letter-spacing:.22em;color:var(--teal);font-weight:700;text-transform:uppercase}"
+      + "h1{font-family:Georgia,'Times New Roman',serif;font-weight:600;font-size:30px;margin:10px 0 2px}"
+      + ".meta{color:var(--muted);font-size:13px;margin-bottom:22px}"
+      + ".sumline{display:flex;gap:34px;border:1px solid var(--line);border-left:4px solid var(--gold);border-radius:8px;padding:14px 18px;margin-bottom:30px}"
+      + ".sumline .v{font-size:20px;font-weight:700}.sumline .l{font-size:11.5px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}"
+      + ".prospect{border:1px solid var(--line);border-radius:10px;padding:20px 22px;margin-bottom:16px;page-break-inside:avoid}"
+      + ".p-name{font-family:Georgia,serif;font-size:19px;font-weight:600}"
+      + ".p-sub{color:var(--muted);font-size:13.5px;margin-top:1px}"
+      + ".facts{display:flex;gap:22px;flex-wrap:wrap;font-size:13px;color:var(--ink);margin:10px 0 2px}"
+      + ".facts b{color:var(--muted);font-weight:600;font-size:11px;letter-spacing:.04em;text-transform:uppercase;margin-right:5px}"
+      + ".slabel,.nlabel{font-size:11px;letter-spacing:.07em;text-transform:uppercase;color:var(--teal);font-weight:700;margin:14px 0 6px}"
+      + ".steps{margin:0 0 2px 18px;font-size:13.5px}.steps li{margin:3px 0;padding-left:2px}"
+      + ".steps .when{color:var(--muted);font-size:12px;margin-left:8px}"
+      + ".none{color:var(--muted);font-size:13px;font-style:italic}"
+      + ".notes{background:#f7f9f9;border-radius:8px;padding:12px 14px;font-size:13.5px;margin-top:12px}"
+      + "footer{margin-top:34px;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);font-size:11.5px;display:flex;justify-content:space-between}"
+      + ".printbtn{position:fixed;top:16px;right:16px;background:var(--teal);color:#fff;border:none;border-radius:8px;padding:10px 18px;font-size:14px;font-weight:600;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.18)}"
+      + "@media print{.printbtn{display:none}body{padding:0}}"
+      + "</style></head><body>"
+      + "<button class='printbtn' onclick='window.print()'>Print / Save as PDF</button>"
+      + "<div class='band'><div class='wordmark'>Partners Mortgage &middot; National Business Development</div>"
+      + "<h1>Recruiting Pipeline — " + esc(stageLabel) + "</h1>"
+      + "<div class='meta'>" + today + " &nbsp;&middot;&nbsp; Prepared by " + preparedBy + "</div></div>"
+      + "<div class='sumline'>"
+      + "<div><div class='v'>" + people.length + "</div><div class='l'>Prospect" + (people.length===1?"":"s") + "</div></div>"
+      + (totalVol ? "<div><div class='v'>" + money(totalVol) + "</div><div class='l'>Combined monthly volume</div></div>" : "")
+      + "</div>"
+      + people.map(prospectBlock).join("")
+      + "<footer><span>Partners Mortgage — internal &amp; confidential</span><span>Generated from RecruitOS</span></footer>"
+      + "</body></html>";
+
+    var blob = new Blob([html], { type:"text/html" });
+    var url = URL.createObjectURL(blob);
+    var w = window.open(url, "_blank");
+    if(!w && typeof showToast === "function") showToast("Pop-up blocked — allow pop-ups to open the report");
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 60000);
+  };
 })();
 </script>
 </body>
