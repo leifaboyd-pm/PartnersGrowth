@@ -27811,6 +27811,30 @@ if(params.get("u") && params.get("pin")){
   }
 })();
 </script>
+
+<!-- ============================================================
+     RECRUIT OS — BUILD STAMP
+     Shows which build is actually running, so "did the deploy
+     take?" is never a guessing game again. Visible in Settings
+     (Data & backup card) and logged to the console.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+  window.__ROS_BUILD = "Build 2026-07-20B \u2014 PDF export \u00B7 volume fix \u00B7 sync merge";
+  try { console.log("[RecruitOS] " + window.__ROS_BUILD); } catch(e){}
+  if(typeof window.viewSettings === "function"){
+    var _vs = window.viewSettings;
+    window.viewSettings = function(){
+      var wrap = _vs.apply(this, arguments);
+      try{
+        wrap.appendChild(e("div",{class:"muted",style:"font-size:11px;margin-top:14px;text-align:center;opacity:.7"}, window.__ROS_BUILD));
+      }catch(err){}
+      return wrap;
+    };
+  }
+})();
+</script>
 </body>
 </html>
 
