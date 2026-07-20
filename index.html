@@ -1,7 +1,4 @@
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
+
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="default">
@@ -27494,10 +27491,10 @@ if(params.get("u") && params.get("pin")){
       ((p.cadence && p.cadence.completed) || []).forEach(function(c){
         var s = byId[c.stepId];
         if(!s) return;
-        var label = s.action || s.short || c.stepId;
+        var label = s.short || s.action || c.stepId;
         if(c.taskId && s.tasks){
           var t = s.tasks.find ? s.tasks.find(function(x){ return x.id === c.taskId; }) : null;
-          if(t) label = (s.short || s.action) + " — " + t.label;
+          if(t) label = t.label;
         }
         out.push({ label: label, when: c.completedAt || 0 });
       });
@@ -27506,92 +27503,157 @@ if(params.get("u") && params.get("pin")){
     return out;
   }
 
-  function prospectBlock(p){
-    var name = esc(((p.firstName||"") + " " + (p.lastName||"")).trim() || "Unnamed prospect");
-    var subBits = [];
-    if(p.company)  subBits.push(esc(p.company));
-    if(p.position) subBits.push(esc(p.position));
-    var sub = subBits.join(" &middot; ");
-    var facts = [];
-    if(p.nmls) facts.push("<span><b>NMLS</b> " + esc(p.nmls) + "</span>");
-    if(p.monthlyVolume) facts.push("<span><b>Monthly volume</b> " + money(p.monthlyVolume) + "</span>");
-    if(p.market) facts.push("<span><b>Market</b> " + esc(p.market) + "</span>");
+  /* ---------- pipeline performance metrics for a column ---------- */
+  function actsFor(pid){ return (state.activities || []).filter(function(a){ return a && a.prospectId === pid; }); }
+  function createdTs(p){
+    if(typeof p.createdAt === "number") return p.createdAt;
+    var t = Date.parse(p.createdAt); return isNaN(t) ? 0 : t;
+  }
+  function enteredColumnTs(p, colId){
+    // earliest stage-change INTO this column; if none and they're in it now, their creation time
+    var ts = 0;
+    actsFor(p.id).forEach(function(a){
+      if(a.type === "stage-change" && typeof a.body === "string" && a.body.indexOf("\u2192 " + colId) !== -1){
+        if(!ts || a.ts < ts) ts = a.ts;
+      }
+    });
+    if(!ts && p.stage === colId) ts = createdTs(p);
+    return ts;
+  }
+  function firstTouchTs(p){
+    var ts = 0;
+    ((p.cadence && p.cadence.completed) || []).forEach(function(c){
+      if(c.completedAt && (!ts || c.completedAt < ts)) ts = c.completedAt;
+    });
+    actsFor(p.id).forEach(function(a){
+      if((a.type === "outreach-sent" || a.type === "task-done") && a.ts && (!ts || a.ts < ts)) ts = a.ts;
+    });
+    return ts;
+  }
+  function hasResponded(p){
+    return actsFor(p.id).some(function(a){ return a.type === "reply" || a.type === "cadence-response"; });
+  }
+  function stageMetrics(colId){
+    // Cohort: everyone who is in the column now OR ever passed through it.
+    var cohort = (state.prospects || []).filter(function(p){
+      if(!p) return false;
+      if(p.stage === colId) return true;
+      return actsFor(p.id).some(function(a){
+        return a.type === "stage-change" && typeof a.body === "string" &&
+               (a.body.indexOf("\u2192 " + colId) !== -1 || a.body.indexOf(colId + " \u2192") === 0);
+      });
+    });
+    var converted = 0, respondents = 0, turnSum = 0, turnN = 0;
+    cohort.forEach(function(p){
+      var entered = enteredColumnTs(p, colId);
+      var reachedEngaged = ["engaged","loi","closed"].indexOf(p.stage) !== -1 ||
+        actsFor(p.id).some(function(a){
+          return a.type === "stage-change" && typeof a.body === "string" &&
+                 a.body.indexOf("\u2192 engaged") !== -1 && (!entered || a.ts >= entered);
+        });
+      if(reachedEngaged) converted++;
+      if(hasResponded(p)) respondents++;
+      var ft = firstTouchTs(p);
+      var start = entered || createdTs(p);
+      if(ft && start && ft >= start){ turnSum += (ft - start); turnN++; }
+    });
+    return {
+      cohortN: cohort.length,
+      convertedN: converted,
+      convPct: cohort.length ? Math.round(converted / cohort.length * 100) : null,
+      respondedN: respondents,
+      respPct: cohort.length ? Math.round(respondents / cohort.length * 100) : null,
+      avgTurnMs: turnN ? (turnSum / turnN) : null
+    };
+  }
+  function fmtDur(ms){
+    if(ms == null) return "\u2014";
+    var h = ms / 3600000;
+    if(h < 24) return (Math.round(h * 10) / 10) + " hrs";
+    return (Math.round(h / 24 * 10) / 10) + " days";
+  }
 
+  /* ---------- compact table row per prospect ---------- */
+  function prospectRow(p){
+    var name = esc(((p.firstName||"") + " " + (p.lastName||"")).trim() || "Unnamed prospect");
+    var sub = [p.company, p.position].filter(Boolean).map(esc).join(" \u00B7 ");
     var steps = completedSteps(p);
     var stepsHtml = steps.length
-      ? "<ol class='steps'>" + steps.map(function(s){
-          return "<li>" + esc(s.label) + (s.when ? "<span class='when'>" + fmtDate(s.when) + "</span>" : "") + "</li>";
-        }).join("") + "</ol>"
-      : "<div class='none'>No outreach steps completed yet.</div>";
-
-    var notesHtml = (p.notes && String(p.notes).trim())
-      ? "<div class='notes'><div class='nlabel'>Notes</div>" + esc(p.notes).replace(/\n/g,"<br>") + "</div>"
+      ? steps.map(function(s){
+          return esc(s.label) + (s.when ? " <span class='d'>(" + fmtDate(s.when) + ")</span>" : "");
+        }).join(" \u00B7 ")
+      : "<span class='none'>None yet</span>";
+    var notes = (p.notes && String(p.notes).trim())
+      ? "<div class='note'>" + esc(String(p.notes).trim()).replace(/\n+/g," \u00B7 ") + "</div>"
       : "";
-
-    return "<section class='prospect'>"
-      + "<div class='p-head'><div><div class='p-name'>" + name + "</div>"
-      + (sub ? "<div class='p-sub'>" + sub + "</div>" : "") + "</div></div>"
-      + (facts.length ? "<div class='facts'>" + facts.join("") + "</div>" : "")
-      + "<div class='slabel'>Steps taken</div>" + stepsHtml
-      + notesHtml
-      + "</section>";
+    return "<tr>"
+      + "<td class='who'><div class='nm'>" + name + "</div>" + (sub ? "<div class='sub'>" + sub + "</div>" : "") + "</td>"
+      + "<td class='num'>" + (p.nmls ? esc(p.nmls) : "\u2014") + "</td>"
+      + "<td class='num'>" + (p.monthlyVolume ? money(p.monthlyVolume) : "\u2014") + "</td>"
+      + "<td class='st'>" + stepsHtml + notes + "</td>"
+      + "</tr>";
   }
 
   window.exportStageReport = function(stageId, stageLabel){
     var people = (state.prospects || []).filter(function(p){ return p && p.stage === stageId; });
     if(!people.length){ if(typeof showToast === "function") showToast("No prospects in " + stageLabel + " to export"); return; }
-    // Order by volume (largest first) so leadership sees the headline names first.
     people = people.slice().sort(function(a,b){ return (b.monthlyVolume||0) - (a.monthlyVolume||0); });
 
     var totalVol = people.reduce(function(s,p){ return s + (Number(p.monthlyVolume)||0); }, 0);
-    var today = new Date().toLocaleDateString("en-US",{weekday:"long",month:"long",day:"numeric",year:"numeric"});
+    var m = stageMetrics(stageId);
+    var today = new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"});
     var preparedBy = (state.user && state.user.name) ? esc(state.user.name) : "Recruiting Team";
 
+    function kpi(v,l,s){ return "<div><div class='v'>" + v + "</div><div class='l'>" + l + (s ? "<span class='s'> " + s + "</span>" : "") + "</div></div>"; }
+    var kpis = kpi(people.length, "Prospect" + (people.length===1?"":"s"))
+      + (totalVol ? kpi(money(totalVol), "Monthly volume") : "")
+      + kpi(m.convPct == null ? "\u2014" : m.convPct + "%", "Converted to Engaged", m.convertedN + " of " + m.cohortN)
+      + kpi(fmtDur(m.avgTurnMs), "Avg. time to first touch")
+      + kpi(m.respPct == null ? "\u2014" : m.respPct + "%", "Responded", m.respondedN + " of " + m.cohortN);
+
     var html = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-      + "<title>Recruiting Pipeline — " + esc(stageLabel) + "</title>"
+      + "<title>Recruiting Pipeline \u2014 " + esc(stageLabel) + "</title>"
       + "<style>"
-      + ":root{--teal:#00818B;--gold:#FFAC27;--ink:#0F1416;--line:#e5e8ea;--muted:#5b6670;}"
+      + ":root{--teal:#00818B;--gold:#FFAC27;--ink:#0F1416;--line:#e2e6e8;--muted:#5b6670;}"
       + "*{box-sizing:border-box;margin:0;padding:0}"
-      + "body{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;color:var(--ink);background:#fff;padding:48px 56px;max-width:860px;margin:0 auto;line-height:1.5}"
-      + ".band{border-top:6px solid var(--teal);padding-top:26px;margin-bottom:6px}"
-      + ".wordmark{font-size:12px;letter-spacing:.22em;color:var(--teal);font-weight:700;text-transform:uppercase}"
-      + "h1{font-family:Georgia,'Times New Roman',serif;font-weight:600;font-size:30px;margin:10px 0 2px}"
-      + ".meta{color:var(--muted);font-size:13px;margin-bottom:22px}"
-      + ".sumline{display:flex;gap:34px;border:1px solid var(--line);border-left:4px solid var(--gold);border-radius:8px;padding:14px 18px;margin-bottom:30px}"
-      + ".sumline .v{font-size:20px;font-weight:700}.sumline .l{font-size:11.5px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}"
-      + ".prospect{border:1px solid var(--line);border-radius:10px;padding:20px 22px;margin-bottom:16px;page-break-inside:avoid}"
-      + ".p-name{font-family:Georgia,serif;font-size:19px;font-weight:600}"
-      + ".p-sub{color:var(--muted);font-size:13.5px;margin-top:1px}"
-      + ".facts{display:flex;gap:22px;flex-wrap:wrap;font-size:13px;color:var(--ink);margin:10px 0 2px}"
-      + ".facts b{color:var(--muted);font-weight:600;font-size:11px;letter-spacing:.04em;text-transform:uppercase;margin-right:5px}"
-      + ".slabel,.nlabel{font-size:11px;letter-spacing:.07em;text-transform:uppercase;color:var(--teal);font-weight:700;margin:14px 0 6px}"
-      + ".steps{margin:0 0 2px 18px;font-size:13.5px}.steps li{margin:3px 0;padding-left:2px}"
-      + ".steps .when{color:var(--muted);font-size:12px;margin-left:8px}"
-      + ".none{color:var(--muted);font-size:13px;font-style:italic}"
-      + ".notes{background:#f7f9f9;border-radius:8px;padding:12px 14px;font-size:13.5px;margin-top:12px}"
-      + "footer{margin-top:34px;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);font-size:11.5px;display:flex;justify-content:space-between}"
-      + ".printbtn{position:fixed;top:16px;right:16px;background:var(--teal);color:#fff;border:none;border-radius:8px;padding:10px 18px;font-size:14px;font-weight:600;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.18)}"
-      + "@media print{.printbtn{display:none}body{padding:0}}"
+      + "body{font-family:-apple-system,'Segoe UI',Helvetica,Arial,sans-serif;color:var(--ink);background:#fff;padding:34px 40px;max-width:960px;margin:0 auto;line-height:1.4;font-size:12.5px}"
+      + ".band{border-top:5px solid var(--teal);padding-top:18px}"
+      + ".wordmark{font-size:10.5px;letter-spacing:.2em;color:var(--teal);font-weight:700;text-transform:uppercase}"
+      + "h1{font-family:Georgia,'Times New Roman',serif;font-weight:600;font-size:23px;margin:6px 0 1px}"
+      + ".meta{color:var(--muted);font-size:11.5px;margin-bottom:14px}"
+      + ".kpis{display:flex;gap:26px;flex-wrap:wrap;border:1px solid var(--line);border-left:4px solid var(--gold);border-radius:8px;padding:10px 16px;margin-bottom:18px}"
+      + ".kpis .v{font-size:17px;font-weight:700}.kpis .l{font-size:10px;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}.kpis .s{color:var(--muted);text-transform:none;letter-spacing:0}"
+      + "table{width:100%;border-collapse:collapse}"
+      + "th{font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--teal);text-align:left;padding:6px 10px;border-bottom:2px solid var(--teal)}"
+      + "td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}"
+      + "tr{page-break-inside:avoid}"
+      + ".who{width:24%}.nm{font-weight:700;font-size:13px}.sub{color:var(--muted);font-size:11px}"
+      + ".num{width:11%;font-variant-numeric:tabular-nums;white-space:nowrap}"
+      + ".st{color:#22303a}.st .d{color:var(--muted);font-size:11px}.none{color:var(--muted);font-style:italic}"
+      + ".note{margin-top:3px;color:var(--muted);font-size:11.5px}.note::before{content:'Notes: ';color:var(--teal);font-weight:700;font-size:10px;letter-spacing:.05em;text-transform:uppercase}"
+      + "footer{margin-top:22px;padding-top:10px;border-top:1px solid var(--line);color:var(--muted);font-size:10.5px;display:flex;justify-content:space-between}"
+      + ".printbtn{position:fixed;top:14px;right:14px;background:var(--teal);color:#fff;border:none;border-radius:8px;padding:9px 16px;font-size:13px;font-weight:600;cursor:pointer;box-shadow:0 4px 14px rgba(0,0,0,.18)}"
+      + "@media print{.printbtn{display:none}body{padding:0;font-size:11.5px}}"
       + "</style></head><body>"
       + "<button class='printbtn' onclick='window.print()'>Print / Save as PDF</button>"
       + "<div class='band'><div class='wordmark'>Partners Mortgage &middot; National Business Development</div>"
-      + "<h1>Recruiting Pipeline — " + esc(stageLabel) + "</h1>"
+      + "<h1>Recruiting Pipeline \u2014 " + esc(stageLabel) + "</h1>"
       + "<div class='meta'>" + today + " &nbsp;&middot;&nbsp; Prepared by " + preparedBy + "</div></div>"
-      + "<div class='sumline'>"
-      + "<div><div class='v'>" + people.length + "</div><div class='l'>Prospect" + (people.length===1?"":"s") + "</div></div>"
-      + (totalVol ? "<div><div class='v'>" + money(totalVol) + "</div><div class='l'>Combined monthly volume</div></div>" : "")
-      + "</div>"
-      + people.map(prospectBlock).join("")
-      + "<footer><span>Partners Mortgage — internal &amp; confidential</span><span>Generated from RecruitOS</span></footer>"
+      + "<div class='kpis'>" + kpis + "</div>"
+      + "<table><thead><tr><th>Prospect</th><th>NMLS</th><th>Mo. volume</th><th>Outreach &amp; notes</th></tr></thead><tbody>"
+      + people.map(prospectRow).join("")
+      + "</tbody></table>"
+      + "<footer><span>Partners Mortgage \u2014 internal &amp; confidential</span><span>Generated from RecruitOS</span></footer>"
       + "</body></html>";
 
     var blob = new Blob([html], { type:"text/html" });
     var url = URL.createObjectURL(blob);
     var w = window.open(url, "_blank");
-    if(!w && typeof showToast === "function") showToast("Pop-up blocked — allow pop-ups to open the report");
+    if(!w && typeof showToast === "function") showToast("Pop-up blocked \u2014 allow pop-ups to open the report");
     setTimeout(function(){ URL.revokeObjectURL(url); }, 60000);
   };
 })();
 </script>
 </body>
 </html>
+
