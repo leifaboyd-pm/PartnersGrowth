@@ -15239,7 +15239,8 @@ function startCadence(p){
   ensureCadence(p);
   p.cadence.startedAt = Date.now();
   p.cadence.paused = false;
-  if(p.stage === STAGE_NEW) p.stage = STAGE_ENGAGED;
+  // Assigning/starting a cadence is what moves a New Prospect into Engaging.
+  if(p.stage === STAGE_NEW) p.stage = "engaging";
   logActivity(p.id, "cadence-started", `Cadence started (${getTemplate(p).name})`);
   persist();
 }
@@ -15779,7 +15780,9 @@ async function syncFromCloudOnBoot(){
     // Cloud is newer (likely another device updated). Apply.
     state.prospects        = bootMerged ? bootMerged.list : (cloud.prospects || []);
     if(bootMerged) state.deletedIds = bootMerged.deleted;
-    state.activities       = cloud.activities       || [];
+    state.activities       = (typeof window.__rosMergeActs === "function")
+      ? window.__rosMergeActs(state.activities || [], cloud.activities || [], bootMerged ? bootMerged.deleted : [])
+      : (cloud.activities || []);
     state.users            = cloud.users            || USERS.slice();
     state.cadenceTemplates = cloud.cadenceTemplates || null;
     state.videoLibrary     = cloud.videoLibrary     || [];
@@ -15806,6 +15809,7 @@ async function syncFromCloudOnBoot(){
     // Local is newer — but push the MERGED union, never just the local list,
     // so prospects that only exist in the cloud aren't bulldozed.
     if(bootMerged){ state.prospects = bootMerged.list; state.deletedIds = bootMerged.deleted; }
+    if(typeof window.__rosMergeActs === "function") state.activities = window.__rosMergeActs(state.activities || [], cloud.activities || [], bootMerged ? bootMerged.deleted : []);
     if(typeof window.__rosCacheSync === "function") window.__rosCacheSync(state.prospects);
     db.pushToCloud(stateToPersist());
   } else {
@@ -16803,6 +16807,13 @@ function kanbanCard(p){
     )
   ));
   card.appendChild(e("div",{class:"kc-meta"}, `${p.company||"—"} · ${p.market||"—"}`));
+  // Created date, visible without opening the card.
+  (function(){
+    var t = (typeof p.createdAt === "number") ? p.createdAt : Date.parse(p.createdAt);
+    if(t && !isNaN(t)){
+      card.appendChild(e("div",{class:"kc-added"}, "Added " + new Date(t).toLocaleDateString("en-US",{month:"short",day:"numeric"}) + (new Date(t).getFullYear() !== new Date().getFullYear() ? ", " + new Date(t).getFullYear() : "")));
+    }
+  })();
 
   // Compact next-step display. Full checklist lives on the prospect detail
   // page — keeping cards small means more columns visible without scrolling.
@@ -17819,6 +17830,7 @@ function pdOverview(p){
     e("div",{class:"card"},
       kvList([
         ["Stage",          stageSelect(p)],
+        ["Origin column",  originSelect(p)],
         ["Production",     `$${p.estProduction||0}M · ${p.productionTier||"Unknown"}`],
         ["Recruiter",      assignedSelect(p)],
         ["Last contact",   p.lastContact ? fmtDate(p.lastContact)+" ("+fmtDateTime(p.lastContact)+")" : "—"],
@@ -17865,11 +17877,33 @@ function stageSelect(p){
   const sel = e("select",{onChange:ev=>{
     const old = p.stage;
     p.stage = ev.target.value;
+    // Same report-field stamping as drag-and-drop, so every path to
+    // LOI/Closed keeps the weekly report in lockstep.
+    if(p.stage === "loi" && !p.loiOutDate) p.loiOutDate = Date.now();
+    if(p.stage === "closed" && !p.hireDate) p.hireDate = Date.now();
     logActivity(p.id,"stage-change",`Stage: ${getStageLabel(old)} → ${getStageLabel(p.stage)}`);
     persist();
     showToast("Stage updated");
   }});
   getStages().forEach(stg => { const o = e("option",{value:stg.id},stg.label); if(p.stage===stg.id) o.selected=true; sel.appendChild(o) });
+  return sel;
+}
+function originSelect(p){
+  // Which column this person STARTED in — drives conversion tracking on the
+  // column exports. Auto-detected when history exists; editable here so a
+  // prospect whose history was lost can be counted correctly.
+  if(state.user.role === "viewer"){
+    return document.createTextNode(getStageLabel(p.originStage || p.stage));
+  }
+  const cur = p.originStage || (Array.isArray(p.stagesSeen) && p.stagesSeen[0]) || p.stage;
+  const sel = e("select",{onChange:ev=>{
+    p.originStage = ev.target.value;
+    if(!Array.isArray(p.stagesSeen)) p.stagesSeen = p.stage ? [p.stage] : [];
+    if(p.stagesSeen.indexOf(p.originStage) === -1) p.stagesSeen.unshift(p.originStage);
+    persist();
+    showToast("Origin updated — they'll count in that column's conversion");
+  }});
+  getStages().forEach(stg => { const o = e("option",{value:stg.id},stg.label); if(cur===stg.id) o.selected=true; sel.appendChild(o) });
   return sel;
 }
 function assignedSelect(p){
@@ -22930,7 +22964,7 @@ function viewReports(){
         const vol = getMonthlyVolume(h);
         const item = e("div",{class:"rpt-hire-item"},
           e("a",{href:"#", class:"rpt-name-link", onClick:ev=>{ev.preventDefault(); navigate("prospect:"+h.id);}}, h.firstName + " " + h.lastName),
-          e("span",{class:"rpt-hire-vol"}, vol ? fmtMoneyShort(vol) + "/mo" : "\u2014"),
+          e("span",{class:"rpt-hire-vol"}, vol ? fmtMoneyShort(vol) + "/yr" : "\u2014"),
           e("span",{class:"rpt-code"}, recCode(h.responsibleParty||h.assignedTo))
         );
         if(canEdit) item.appendChild(e("button",{class:"rpt-hire-x", title:"Remove hire", onClick:()=>{ uiConfirm("Undo hire for " + h.firstName + " " + h.lastName + "? They move back to Engaged.", ()=>{ h.stage = STAGE_ENGAGED; h.hireDate = null; persist(); reRender(); }, { title:"Undo hire", okLabel:"Undo" }); }}, "\u00D7"));
@@ -25165,9 +25199,17 @@ if(params.get("u") && params.get("pin")){
   "use strict";
   function viewWorkNow(){
     const wrap = e("div",{class:"screen"});
+    // This page is ONLY for active working stages: Engaging, Engaged, and
+    // Webinar Leads (matched by label so the custom column's id doesn't
+    // matter). Closed, LOI Out, Long Term Nurture, and New are excluded.
+    const allowed = {};
+    (typeof getStages === "function" ? getStages() : []).forEach(function(s){
+      if(!s) return;
+      if(s.id === "engaging" || s.id === "engaged" || /webinar/i.test(String(s.label||""))) allowed[s.id] = true;
+    });
     const mine = state.prospects.slice(); // shared team pipeline — everyone sees all
     const list = mine
-      .filter(p => p.stage !== "closed" && !(window.isDNC && isDNC(p)))
+      .filter(p => allowed[p.stage] && !(window.isDNC && isDNC(p)))
       .map(p => ({ p, t: Math.max(p.createdAt||0, (typeof lastTouchTs === "function" ? (lastTouchTs(p)||0) : 0)) }))
       .sort((a,b) => b.t - a.t);
 
@@ -25274,8 +25316,11 @@ if(params.get("u") && params.get("pin")){
       : null;
     state.prospects = merged ? merged.list : incoming;
     if(merged) state.deletedIds = merged.deleted;
+    // Activities merge as a union in BOTH directions so history survives.
+    state.activities = (typeof window.__rosMergeActs === "function")
+      ? window.__rosMergeActs(state.activities || [], cloud.activities || [], merged ? merged.deleted : [])
+      : (newer ? (cloud.activities || []) : state.activities);
     if(newer){
-      state.activities       = cloud.activities       || [];
       state.users            = cloud.users            || (typeof USERS !== "undefined" ? USERS.slice() : state.users);
       state.cadenceTemplates = cloud.cadenceTemplates || null;
       state.videoLibrary     = cloud.videoLibrary     || [];
@@ -26467,6 +26512,7 @@ if(params.get("u") && params.get("pin")){
   .k-card .kc-av{ width:30px; height:30px; }
   .k-card .kc-name{ font-size:14px; font-weight:650; color:var(--t-1); }
   .k-card .kc-meta{ font-size:11.5px; color:var(--t-3); margin-bottom:9px; }
+  .k-card .kc-added{ font-size:10px; color:var(--t-3); opacity:.75; margin:-5px 0 8px; letter-spacing:.02em; }
 
   /* Quieter badges — dollar figure + role read as light text, not chips */
   .k-card .kc-tier{ background:transparent; color:var(--t-2); font-weight:700; padding:0; }
@@ -26708,16 +26754,10 @@ if(params.get("u") && params.get("pin")){
   }
   window.autoAssignCadence = autoAssignCadence;
 
-  // After research runs (or fails), assign the best-fit cadence → Engaging.
-  if(typeof window.runResearch === "function"){
-    var _rr = window.runResearch;
-    window.runResearch = async function(p, opts){
-      try { return await _rr(p, opts); }
-      finally {
-        try { if(autoAssignCadence(p) && typeof navigate === "function") navigate(state.screen, { replace:true }); } catch(e){}
-      }
-    };
-  }
+  // MANUAL CADENCE POLICY: research runs automatically on import/add, but a
+  // cadence is NEVER auto-assigned. Prospects stay in New Prospect until the
+  // team assigns/starts a cadence by hand, which moves them to Engaging.
+  // (autoAssignCadence remains defined for manual use but is not auto-called.)
 
   // NOTE: the old every-save "normalizeAll()" hook was REMOVED. It force-switched
   // every prospect sitting in Engaged onto Peter's Playbook on every single save,
@@ -26777,12 +26817,38 @@ if(params.get("u") && params.get("pin")){
       }
       var ids = currentStageIds();
       var fallback = ids.indexOf("engaging") !== -1 ? "engaging" : ids[0];
+      // Translate a stage reference from history (an id OR a display label,
+      // possibly from a since-recreated column) to a CURRENT column id.
+      var labelToId = {};
+      (state.stages || CANON_STAGES).forEach(function(s){ if(s) labelToId[String(s.label||"").toLowerCase().trim()] = s.id; });
+      function toStageId(ref){
+        var r = String(ref||"").replace(/^Stage:\s*/i,"").replace(/\s*\(.*\)\s*$/,"").trim();
+        if(!r) return null;
+        if(ids.indexOf(r) !== -1) return r;
+        return labelToId[r.toLowerCase()] || null;
+      }
       (state.prospects || []).forEach(function(p){
-        if(p && ids.indexOf(p.stage) === -1){ p.stage = fallback; changed = true; }
+        if(!p) return;
+        if(ids.indexOf(p.stage) === -1){ p.stage = fallback; changed = true; }
         // Backfill report date fields for anyone already sitting in LOI/Closed
         // so pipeline placement is always reflected on the weekly report.
-        if(p && p.stage === "loi" && !p.loiOutDate){ p.loiOutDate = Date.now(); changed = true; }
-        if(p && p.stage === "closed" && !p.hireDate){ p.hireDate = Date.now(); changed = true; }
+        if(p.stage === "loi" && !p.loiOutDate){ p.loiOutDate = Date.now(); changed = true; }
+        if(p.stage === "closed" && !p.hireDate){ p.hireDate = Date.now(); changed = true; }
+        // Structural stage-history: seed stagesSeen + originStage from the
+        // activity log ONCE (ids and labels both recognized), then it's
+        // maintained automatically on every save.
+        if(!Array.isArray(p.stagesSeen)){ p.stagesSeen = p.stage ? [p.stage] : []; changed = true; }
+        var acts = (state.activities || []).filter(function(a){ return a && a.prospectId === p.id && a.type === "stage-change" && typeof a.body === "string"; })
+                    .sort(function(a,b){ return (a.ts||0) - (b.ts||0); });
+        acts.forEach(function(a, idx){
+          var parts = a.body.split("\u2192");
+          if(parts.length < 2) return;
+          var from = toStageId(parts[0]), to = toStageId(parts[parts.length-1]);
+          if(from && p.stagesSeen.indexOf(from) === -1){ p.stagesSeen.push(from); changed = true; }
+          if(to && p.stagesSeen.indexOf(to) === -1){ p.stagesSeen.push(to); changed = true; }
+          if(idx === 0 && from && !p.originStage){ p.originStage = from; changed = true; }
+        });
+        if(!p.originStage){ p.originStage = (p.stagesSeen[0] || p.stage); changed = true; }
       });
       if(changed){
         persist();
@@ -26799,8 +26865,9 @@ if(params.get("u") && params.get("pin")){
     try{
       (state.prospects || []).forEach(function(p){
         if(!p || p.stage !== "new" || (p.cadence && p.cadence.startedAt)) return;
-        if(p.research && !p.research.error){ autoAssignCadence(p); }
-        else if(typeof queueAutoResearch === "function"){ queueAutoResearch(p); }
+        // Research-only: queue research for un-researched New prospects.
+        // Cadence assignment is manual; they stay in New until the team assigns one.
+        if(!(p.research && !p.research.error) && typeof queueAutoResearch === "function"){ queueAutoResearch(p); }
       });
     }catch(e){ console.error("unstick new", e); }
   }
@@ -27382,8 +27449,27 @@ if(params.get("u") && params.get("pin")){
   window.__rosCacheSync = cacheSync;
   cacheSync(typeof state !== "undefined" ? state.prospects : []);
 
+  var _lastStage = {};   // id -> stage at last save (for structural stage tracking)
+
+  function trackStages(){
+    try{
+      (state.prospects || []).forEach(function(p){
+        if(!p || !p.id) return;
+        // House rule: a New Prospect with an assigned/started cadence belongs
+        // in Engaging — whichever path started the cadence.
+        if(p.stage === "new" && p.cadence && p.cadence.startedAt) p.stage = "engaging";
+        if(!Array.isArray(p.stagesSeen)) p.stagesSeen = p.stage ? [p.stage] : [];
+        var prev = _lastStage[p.id];
+        if(p.stage && p.stagesSeen.indexOf(p.stage) === -1) p.stagesSeen.push(p.stage);
+        if(prev && prev !== p.stage && p.stagesSeen.indexOf(prev) === -1) p.stagesSeen.push(prev);
+        _lastStage[p.id] = p.stage;
+      });
+    }catch(e){}
+  }
+
   function stampChanged(){
     try{
+      trackStages();
       (state.prospects || []).forEach(function(p){
         if(!p || !p.id) return;
         var k = keyOf(p);
@@ -27421,6 +27507,25 @@ if(params.get("u") && params.get("pin")){
   // Returns { list, deleted, localContributed }.
   // localContributed = this device held records/deletions the cloud lacked,
   // so the caller should push the union back up to converge everyone.
+  // Activities merge as a UNION by id (capped, newest kept), so stage-change
+  // history and replies can never be clobbered by another device's whole-list
+  // write again — that clobbering is how conversion history got lost.
+  window.__rosMergeActs = function(localArr, cloudArr, deletedIds){
+    localArr = localArr || []; cloudArr = cloudArr || [];
+    var del = {};
+    (deletedIds || []).forEach(function(id){ if(id) del[id] = true; });
+    var byId = {};
+    cloudArr.concat(localArr).forEach(function(a){
+      if(!a || !a.id) return;
+      if(a.prospectId && del[a.prospectId]) return; // drop orphans of deleted prospects
+      if(!byId[a.id]) byId[a.id] = a;
+    });
+    var out = Object.keys(byId).map(function(k){ return byId[k]; });
+    out.sort(function(a,b){ return (b.ts||0) - (a.ts||0); });
+    if(out.length > 2000) out = out.slice(0, 2000);
+    return out;
+  };
+
   window.__rosMerge = function(localArr, cloudArr, localDel, cloudDel){
     localArr = localArr || []; cloudArr = cloudArr || [];
     var del = {};
@@ -27555,24 +27660,23 @@ if(params.get("u") && params.get("pin")){
   function hasResponded(p){
     return actsFor(p.id).some(function(a){ return a.type === "reply" || a.type === "cadence-response"; });
   }
+  function wasInColumn(p, colId){
+    if(!p) return false;
+    if(p.stage === colId) return true;
+    if(Array.isArray(p.stagesSeen) && p.stagesSeen.indexOf(colId) !== -1) return true;
+    if(p.originStage === colId) return true;
+    return false;
+  }
   function stageMetrics(colId){
-    // Cohort: everyone who is in the column now OR ever passed through it.
-    var cohort = (state.prospects || []).filter(function(p){
-      if(!p) return false;
-      if(p.stage === colId) return true;
-      return actsFor(p.id).some(function(a){
-        return a.type === "stage-change" && typeof a.body === "string" &&
-               (a.body.indexOf("\u2192 " + colId) !== -1 || a.body.indexOf(colId + " \u2192") === 0);
-      });
-    });
+    // Cohort: everyone who is in the column now OR was EVER in it (tracked
+    // structurally on the prospect, so it survives column recreations, label
+    // renames, and history written in either ids or labels).
+    var cohort = (state.prospects || []).filter(function(p){ return wasInColumn(p, colId); });
     var converted = 0, respondents = 0, turnSum = 0, turnN = 0;
     cohort.forEach(function(p){
       var entered = enteredColumnTs(p, colId);
       var reachedEngaged = ["engaged","loi","closed"].indexOf(p.stage) !== -1 ||
-        actsFor(p.id).some(function(a){
-          return a.type === "stage-change" && typeof a.body === "string" &&
-                 a.body.indexOf("\u2192 engaged") !== -1 && (!entered || a.ts >= entered);
-        });
+        (Array.isArray(p.stagesSeen) && (p.stagesSeen.indexOf("engaged") !== -1 || p.stagesSeen.indexOf("loi") !== -1 || p.stagesSeen.indexOf("closed") !== -1));
       if(reachedEngaged) converted++;
       if(hasResponded(p)) respondents++;
       var ft = firstTouchTs(p);
@@ -27638,12 +27742,14 @@ if(params.get("u") && params.get("pin")){
     if(!people.length){ if(typeof showToast === "function") showToast("No prospects in " + stageLabel + " to export"); return; }
     people = people.slice().sort(function(a,b){ return (b.monthlyVolume||0) - (a.monthlyVolume||0); });
 
-    _annualMode = (stageId === "closed");
+    _annualMode = (stageId === "closed" || /hire|hired|joined|closed/i.test(String(stageLabel || "")));
     var totalVol = people.reduce(function(s,p){ var d = volDollars(p); return s + (d ? d.v : 0); }, 0);
     var m = stageMetrics(stageId);
     // Company convention: hires are quoted ANNUALLY (e.g. "10M / yr"),
     // active pipeline is quoted monthly. Label accordingly.
-    var isHires = stageId === "closed";
+    // Hires are annual. Recognize the hires column by id OR label so a
+    // recreated/renamed column ("Hired", "Closed / Joined", etc.) still counts.
+    var isHires = stageId === "closed" || /hire|hired|joined|closed/i.test(String(stageLabel || ""));
     var volLabel = isHires ? "Annual volume" : "Monthly volume";
     var volTh = isHires ? "Annual volume" : "Mo. volume";
     var today = new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"});
@@ -27821,7 +27927,7 @@ if(params.get("u") && params.get("pin")){
 <script>
 (function(){
   "use strict";
-  window.__ROS_BUILD = "Build 2026-07-20B \u2014 PDF export \u00B7 volume fix \u00B7 sync merge";
+  window.__ROS_BUILD = "Build 2026-07-20C \u2014 conversion tracking + origin control";
   try { console.log("[RecruitOS] " + window.__ROS_BUILD); } catch(e){}
   if(typeof window.viewSettings === "function"){
     var _vs = window.viewSettings;
