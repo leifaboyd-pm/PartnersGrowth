@@ -15635,17 +15635,45 @@ const db = {
       // Firestore rejects undefined values (it allows null, but not undefined).
       // Scrub the whole tree before sending so a stray undefined anywhere in
       // a deep nested object can't bring down the entire sync.
-      const safe = deepStripUndefined({ ...snapshot, _updatedAt: Date.now() });
-      // SIZE GUARD: Firestore hard-caps a document at ~1 MB. If the snapshot is
-      // getting close, the write will eventually fail SILENTLY and profiles will
-      // drift apart. Surface it loudly (once per session) so it can be addressed
-      // (usually by archiving old activity) instead of quietly breaking sync.
+      let safe = deepStripUndefined({ ...snapshot, _updatedAt: Date.now() });
+      // AUTO-SLIM: Firestore hard-caps a document at ~1 MB — past it, writes
+      // fail and devices stop syncing entirely. Rather than warn and break,
+      // progressively slim the CLOUD COPY (local data is never touched):
+      //   1. strip per-prospect research debug logs (AI transcripts — the
+      //      main bloat; the useful research fields are kept),
+      //   2. trim the activity log to the most recent entries with capped
+      //      body lengths.
       try{
-        const bytes = new Blob([JSON.stringify(safe)]).size;
-        if(bytes > 900000 && !window._sizeWarned){
-          window._sizeWarned = true;
-          console.warn("[cloud] snapshot " + Math.round(bytes/1024) + "KB — approaching Firestore's 1MB per-document limit");
-          if(typeof showToast === "function") showToast("Heads up: your data is large (" + Math.round(bytes/1024) + " KB). Near 1 MB, syncing can fail. Consider archiving old activity.");
+        const sizeOf = o => new Blob([JSON.stringify(o)]).size;
+        let bytes = sizeOf(safe);
+        const LIMIT = 900000;
+        if(bytes > LIMIT && Array.isArray(safe.prospects)){
+          safe = { ...safe, prospects: safe.prospects.map(p => {
+            if(p && p.research && (p.research.logEntry || p.research.photoCandidates)){
+              const r = { ...p.research }; delete r.logEntry; delete r.photoCandidates;
+              return { ...p, research: r };
+            }
+            return p;
+          }) };
+          bytes = sizeOf(safe);
+        }
+        let trimmedActs = false;
+        [1000, 500, 200].forEach(cap => {
+          if(bytes > LIMIT && Array.isArray(safe.activities) && safe.activities.length > cap){
+            safe = { ...safe, activities: safe.activities.slice(0, cap).map(a =>
+              (a && typeof a.body === "string" && a.body.length > 240) ? { ...a, body: a.body.slice(0, 240) + "\u2026" } : a
+            ) };
+            bytes = sizeOf(safe); trimmedActs = true;
+          }
+        });
+        if(bytes > LIMIT){
+          console.warn("[cloud] snapshot still " + Math.round(bytes/1024) + "KB after slimming");
+          if(!window._sizeWarned){ window._sizeWarned = true;
+            if(typeof showToast === "function") showToast("Data is very large (" + Math.round(bytes/1024) + " KB) — sync may fail. Tell your admin.");
+          }
+        } else if(trimmedActs && !window._slimNoted){
+          window._slimNoted = true;
+          console.log("[cloud] auto-slimmed snapshot to " + Math.round(bytes/1024) + "KB (research debug logs / old activity trimmed from the cloud copy only)");
         }
       }catch(e){}
       await fb.setDoc(ref, safe);
@@ -15655,7 +15683,7 @@ const db = {
       setCloudStatus("error", err);
       // Make a size-limit failure loud instead of silent.
       if(/longer than|1048576|exceeds maximum|too large/i.test(String((err && err.message) || "")) && typeof showToast === "function"){
-        showToast("Sync failed: your data passed Firestore's 1 MB limit. Old activity needs archiving before syncing works again.");
+        showToast("Sync failed: data passed Firestore's 1 MB limit even after auto-trim. Tell your admin.");
       }
       throw err;
     }
@@ -17292,12 +17320,15 @@ function viewProspectDetail(p){
   // Tabs
   const tabs = e("div",{class:"pd-tabs"});
   const TABS = ["Playbook","Research","Overview","Activity","Notes","Files"];
-  let activeTab = p._activeTab || "Playbook";
+  // Tab choice is LOCAL UI state — kept off the synced record so a cloud
+  // merge replacing this prospect can't yank the user back to Playbook.
+  window._pdTabs = window._pdTabs || {};
+  let activeTab = window._pdTabs[p.id] || p._activeTab || "Playbook";
   // Migrate any old "AI" activeTab to Research (e.g. from quickAI)
   if(activeTab === "AI") activeTab = "Research";
   TABS.forEach(t => {
     const tab = e("button",{class:"pd-tab"+(t===activeTab?" active":""), onClick:()=>{
-      p._activeTab = t;
+      window._pdTabs[p.id] = t;
       navigate(state.screen, {replace:true});
     }}, t);
     tabs.appendChild(tab);
@@ -18293,7 +18324,7 @@ async function runResearch(p, opts = {}){
         failedAt: Date.now(),
         modelUsed: CONFIG.anthropicModel,
         truncated: wasTruncated,
-        logEntry: p._researchEntry ? sanitizeLogForExport(p._researchEntry) : null
+        logEntry: p._researchEntry ? (function(l){ try{ var c = sanitizeLogForExport(l); var j = JSON.stringify(c); return j.length > 4000 ? { error: c && c.error, phase: c && c.phase, truncated: true } : c; }catch(e){ return null; } })(p._researchEntry) : null
       };
       persist();
       throw new Error("AI response wasn't valid JSON" + parseErr);
@@ -18330,7 +18361,7 @@ async function runResearch(p, opts = {}){
         errorDetails: rawText ? rawText.slice(0, 12000) : "",
         failedAt: Date.now(),
         modelUsed: CONFIG.anthropicModel,
-        logEntry: p._researchEntry ? sanitizeLogForExport(p._researchEntry) : null
+        logEntry: p._researchEntry ? (function(l){ try{ var c = sanitizeLogForExport(l); var j = JSON.stringify(c); return j.length > 4000 ? { error: c && c.error, phase: c && c.phase, truncated: true } : c; }catch(e){ return null; } })(p._researchEntry) : null
       };
       persist();
     }
@@ -21357,7 +21388,10 @@ function activityLabel(type){
   })[type] || type;
 }
 function logActivity(prospectId, type, body){
-  state.activities.unshift({ id:uid(), prospectId, user:state.user.id, type, body, ts:Date.now() });
+  // Cap body length — huge bodies (AI drafts, long notes) bloat the synced
+  // snapshot toward Firestore's 1 MB document limit.
+  var b = (typeof body === "string" && body.length > 500) ? body.slice(0, 500) + "\u2026" : body;
+  state.activities.unshift({ id:uid(), prospectId, user:state.user.id, type, body: b, ts:Date.now() });
   if(["text-sent","linkedin-sent","email-sent","call","reply"].includes(type)){
     const p = state.prospects.find(x=>x.id===prospectId);
     if(p) p.lastContact = Date.now();
@@ -25295,7 +25329,13 @@ if(params.get("u") && params.get("pin")){
     return false;
   }
 
+  function uiSignature(){
+    try{
+      return JSON.stringify(state.prospects) + "|" + (state.activities||[]).length + "|" + JSON.stringify(state.stages||[]) + "|" + (state.users||[]).length;
+    }catch(e){ return String(Math.random()); }
+  }
   function applyCloudState(cloud, cloudTime){
+    var _sigBefore = uiSignature();
     var incoming = cloud.prospects || [];
     var incomingReal = incoming.some(function(p){ return p && !p._seed; });
     var localReal = state.prospects && state.prospects.some(function(p){ return p && !p._seed; });
@@ -25333,8 +25373,10 @@ if(params.get("u") && params.get("pin")){
     }
     if(typeof window.__rosCacheSync === "function") window.__rosCacheSync(state.prospects);
     // If this device held records/deletions the cloud didn't, push the merged
-    // result back so every device converges on the union.
-    if(merged && merged.localContributed){
+    // result back so every device converges on the union — throttled so two
+    // devices can't ping-pong convergence pushes at each other.
+    if(merged && merged.localContributed && (Date.now() - (window._lastConvergePush || 0) > 15000)){
+      window._lastConvergePush = Date.now();
       state.lastModified = Date.now();
       try { db.pushToCloud(stateToPersist()); } catch(e){}
     }
@@ -25350,15 +25392,28 @@ if(params.get("u") && params.get("pin")){
     }
 
     try { localStorage.setItem(LS_KEY, JSON.stringify(stateToPersist())); } catch(e){}
-    if(state.user && typeof render === "function") render();
+    // QUIET APPLY: if nothing the user can see actually changed (echoes,
+    // idempotent merges), skip the re-render entirely — no view reset, no
+    // toast. When something DID change, re-render but preserve scroll so the
+    // user isn't yanked around mid-read.
+    var changed = uiSignature() !== _sigBefore;
+    if(changed && state.user && typeof render === "function"){
+      var sy = window.scrollY, kb = document.querySelector(".kanban-wrap"), kx = kb ? kb.scrollLeft : 0;
+      render();
+      requestAnimationFrame(function(){
+        try{ window.scrollTo(0, sy); var kb2 = document.querySelector(".kanban-wrap"); if(kb2) kb2.scrollLeft = kx; }catch(e){}
+      });
+    }
     if(typeof setCloudStatus === "function") setCloudStatus("synced");
+    return changed;
   }
 
   function maybeApply(cloud, cloudTime){
     if(isBusy()){ pending = { cloud: cloud, cloudTime: cloudTime }; return; }
     const wasFirst = firstSnap;
-    applyCloudState(cloud, cloudTime);
-    if(!wasFirst && state.user && typeof showToast === "function"){
+    const changed = applyCloudState(cloud, cloudTime);
+    // Only announce updates that actually changed something visible.
+    if(changed && !wasFirst && state.user && typeof showToast === "function"){
       showToast("Updated from another teammate");
     }
   }
@@ -26759,6 +26814,31 @@ if(params.get("u") && params.get("pin")){
   // team assigns/starts a cadence by hand, which moves them to Engaging.
   // (autoAssignCadence remains defined for manual use but is not auto-called.)
 
+  // RESEARCH LANDS ON THE LIVE RECORD: runResearch holds a reference to the
+  // prospect object it started with. If a cloud merge replaces that object
+  // mid-research (30-60s window), results would be written to an orphan and
+  // silently lost — research "never finishes" and gets re-queued forever.
+  // After every research run, graft the results onto whichever object is now
+  // live in state, then save.
+  if(typeof window.runResearch === "function"){
+    var _rrLive = window.runResearch;
+    var GRAFT = ["research","linkedin","instagram","phone","email","nmls","company","market","position","estProduction","productionTier"];
+    window.runResearch = async function(p, opts){
+      var pid = p && p.id;
+      try { return await _rrLive(p, opts); }
+      finally {
+        try{
+          var live = pid && (state.prospects || []).find(function(x){ return x && x.id === pid; });
+          if(live && live !== p){
+            GRAFT.forEach(function(k){ if(p[k] !== undefined && p[k] !== null) live[k] = p[k]; });
+            persist();
+            if(typeof navigate === "function" && state.user) navigate(state.screen, { replace:true });
+          }
+        }catch(e){ console.error("research graft", e); }
+      }
+    };
+  }
+
   // NOTE: the old every-save "normalizeAll()" hook was REMOVED. It force-switched
   // every prospect sitting in Engaged onto Peter's Playbook on every single save,
   // which wiped their LinkedIn/outreach cadence progress. Stage rescue now happens
@@ -27439,7 +27519,10 @@ if(params.get("u") && params.get("pin")){
 
   function keyOf(p){
     if(!p) return "";
-    var c = {}; for(var k in p){ if(k !== "_rev") c[k] = p[k]; }
+    // Ignore _-prefixed fields (revision stamps, leftover UI state like the
+    // old _activeTab) so tab clicks and internal bookkeeping never register
+    // as edits that could win a sync conflict.
+    var c = {}; for(var k in p){ if(k.charAt(0) !== "_") c[k] = p[k]; }
     try { return JSON.stringify(c); } catch(e){ return ""; }
   }
   function cacheSync(list){
@@ -27538,12 +27621,28 @@ if(params.get("u") && params.get("pin")){
       if(!p || !p.id || del[p.id]) return;
       byId[p.id] = p; order.push(p.id);
     });
+    // When both sides have the record, the newer _rev wins — but hard-won
+    // one-sided data (research results, stage tracking, report dates) is
+    // GRAFTED from the loser so it can never be silently discarded.
+    function graft(w, l){
+      if(!w || !l) return w;
+      if(!w.research && l.research) w.research = l.research;
+      ["originStage","loiOutDate","hireDate","linkedin","instagram","nmls"].forEach(function(k){
+        if((w[k] == null || w[k] === "") && l[k] != null && l[k] !== "") w[k] = l[k];
+      });
+      if(Array.isArray(l.stagesSeen)){
+        if(!Array.isArray(w.stagesSeen)) w.stagesSeen = [];
+        l.stagesSeen.forEach(function(s){ if(w.stagesSeen.indexOf(s) === -1) w.stagesSeen.push(s); });
+      }
+      return w;
+    }
     var contributed = localOnlyDel;
     localArr.forEach(function(p){
       if(!p || !p.id || del[p.id]) return;
       var c = byId[p.id];
       if(!c){ byId[p.id] = p; order.push(p.id); contributed = true; }
-      else if((p._rev || 0) > (c._rev || 0)){ byId[p.id] = p; contributed = true; }
+      else if((p._rev || 0) > (c._rev || 0)){ byId[p.id] = graft(p, c); contributed = true; }
+      else { byId[p.id] = graft(c, p); }
     });
     return {
       list: order.map(function(id){ return byId[id]; }),
@@ -27927,7 +28026,7 @@ if(params.get("u") && params.get("pin")){
 <script>
 (function(){
   "use strict";
-  window.__ROS_BUILD = "Build 2026-07-20C \u2014 conversion tracking + origin control";
+  window.__ROS_BUILD = "Build 2026-07-22D \u2014 quiet sync + size auto-trim";
   try { console.log("[RecruitOS] " + window.__ROS_BUILD); } catch(e){}
   if(typeof window.viewSettings === "function"){
     var _vs = window.viewSettings;
