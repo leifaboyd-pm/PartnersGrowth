@@ -25244,13 +25244,18 @@ if(params.get("u") && params.get("pin")){
     const mine = state.prospects.slice(); // shared team pipeline — everyone sees all
     const list = mine
       .filter(p => allowed[p.stage] && !(window.isDNC && isDNC(p)))
-      .map(p => ({ p, t: Math.max(p.createdAt||0, (typeof lastTouchTs === "function" ? (lastTouchTs(p)||0) : 0)) }))
-      .sort((a,b) => b.t - a.t);
+      // ONLY people whose next touch is due or overdue RIGHT NOW. Someone
+      // whose next touch is scheduled for the future is on the clock — they
+      // don't belong on this page until their touch comes due.
+      .map(p => ({ p, task: (typeof window.touchReadyNow === "function") ? window.touchReadyNow(p) : null }))
+      .filter(x => !!x.task)
+      .map(x => ({ p: x.p, t: (x.task.unlockAt || 0) }))
+      .sort((a,b) => a.t - b.t); // most overdue first
 
     wrap.appendChild(e("div",{class:"h-section"},
       e("div",{},
         e("h2",{},"What to Work on Now"),
-        e("div",{class:"sub"}, list.length + " active " + (list.length===1?"prospect":"prospects") + " — newest first")
+        e("div",{class:"sub"}, list.length + " touch" + (list.length===1?"":"es") + " due now — most overdue first")
       )
     ));
 
@@ -25263,16 +25268,11 @@ if(params.get("u") && params.get("pin")){
     list.forEach(({p})=>{
       const trigs = behavioralTriggers(p);
       const kind = trigs.length ? trigs[0].kind : "info";
-      const eng = engagementScore(p), rec = recruitabilityScore(p);
       panel.appendChild(e("button",{class:"intel-row",onClick:()=>navigate("prospect:"+p.id)},
         e("div",{class:"intel-rank k-"+kind}, htmlNode(intelKindIcon(kind))),
         e("div",{class:"intel-main"},
           e("div",{class:"intel-name"}, p.firstName+" "+p.lastName, p.company ? e("span",{class:"intel-co"}, " · "+p.company) : null),
           e("div",{class:"intel-reason"}, priorityReason(p))
-        ),
-        e("div",{class:"intel-scores"},
-          e("span",{class:"intel-chip "+scoreTone(eng), title:"Engagement score"}, "E "+eng),
-          e("span",{class:"intel-chip "+scoreTone(rec), title:"Recruitability score"}, "R "+rec)
         )
       ));
     });
