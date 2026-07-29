@@ -23439,6 +23439,7 @@ function openProspectModal(existing, opts){
         // Auto-stamp hireDate if stage moved to Closed/Joined and they didn't set one
         if(p.stage === STAGE_CLOSED && !p.hireDate) p.hireDate = Date.now();
         if(opts.pin) p.stagePinned = true;   // webinar leads stay put until moved by hand
+        if(String(opts.source || "").toLowerCase() === "webinar") p.webinarLead = true;  // permanent origin mark
         if(!existing) state.prospects.push(p);
         if(!existing && typeof queueAutoResearch === "function") queueAutoResearch(p);
         ensureReportingFields(p);
@@ -25923,52 +25924,132 @@ if(params.get("u") && params.get("pin")){
     return panel;
   };
 
-  // Full page — active-cadence touches on top, then keep-warm categories (LOI Out, etc.).
+  // Full page. THE FRONT IS ENGAGING ONLY — touches we owe people in the
+  // Engaging stage, most overdue first. Everything else lives in clearly
+  // separated sections below it.
   window.viewWorkNow = function(){
     var wrap = e("div",{class:"screen"});
     var mine = myProspectsList();
-    var main = mainReady(mine);
+
+    // ---- FRONT: Engaging touches due now ----
+    var engaging = [];
+    mine.forEach(function(p){
+      if(!p || p.stage !== "engaging") return;
+      if(window.isDNC && isDNC(p)) return;
+      if(hasCallScheduled(p)) return;              // a booked call lives on the closing checklist
+      var t = touchReadyNow(p);
+      if(t) engaging.push({ p:p, t:t });
+    });
+    engaging.sort(function(a,b){ return (a.t.unlockAt || 0) - (b.t.unlockAt || 0); }); // most overdue first
 
     wrap.appendChild(e("div",{class:"h-section"},
       e("div",{},
         e("h2",{},"What to Work on Now"),
-        e("div",{class:"sub"}, main.length + (main.length===1?" touch":" touches") + " due in your active cadences")
+        e("div",{class:"sub"}, engaging.length + (engaging.length===1?" touch":" touches") + " due in Engaging \u2014 most overdue first")
       )
     ));
-    if(!main.length){
-      wrap.appendChild(e("div",{class:"empty",style:"margin-top:20px"}, e("div",{class:"ic"},"✓"), "No cadence touches due right now."));
+    if(!engaging.length){
+      wrap.appendChild(e("div",{class:"empty",style:"margin-top:20px"}, e("div",{class:"ic"},"\u2713"), "No Engaging touches due right now."));
     } else {
       var panel = e("div",{class:"intel-panel"});
-      main.forEach(function(x){ panel.appendChild(workRow(x.p, x.t)); });
+      engaging.forEach(function(x){ panel.appendChild(workRow(x.p, x.t)); });
       wrap.appendChild(panel);
     }
 
-    // Calls set — closing checklist (Intro Call → Deeper Dive → Pricing → Benefits).
+    function head(title, n){
+      return e("div",{class:"wn-group-head"},
+        e("h3",{}, title),
+        e("span",{class:"wn-count"}, String(n))
+      );
+    }
+
+    // ---- ENGAGED: next step for each ----
+    var engaged = mine.filter(function(p){ return p && p.stage === "engaged" && !(window.isDNC && isDNC(p)); });
+    if(engaged.length){
+      wrap.appendChild(head("Engaged \u2014 next steps", engaged.length));
+      var ep = e("div",{class:"intel-panel"});
+      engaged.forEach(function(p){
+        var step = "";
+        if(p.nextStep && String(p.nextStep).trim()) step = String(p.nextStep).trim();
+        else {
+          var t = null;
+          try { t = touchReadyNow(p) || (typeof currentTask === "function" ? currentTask(p) : null); } catch(err){}
+          if(t && t.action) step = t.action;
+        }
+        if(!step) step = "No next step set \u2014 open to set one";
+        var due = null;
+        try { due = touchReadyNow(p); } catch(err){}
+        var row = e("button",{class:"intel-row",onClick:function(){ navigate("prospect:"+p.id); }},
+          e("div",{class:"intel-rank k-info"}, htmlNode(intelKindIcon("info"))),
+          e("div",{class:"intel-main"},
+            e("div",{class:"intel-name"}, (p.firstName||"") + " " + (p.lastName||""),
+              p.company ? e("span",{class:"intel-co"}, " \u00B7 " + p.company) : null),
+            e("div",{class:"intel-reason"}, step)
+          ),
+          due ? e("span",{class:"pill warn",style:"flex:0 0 auto"}, "touch due") : null
+        );
+        ep.appendChild(row);
+      });
+      wrap.appendChild(ep);
+    }
+
+    // ---- LOI OUT: keep them warm ----
+    var loi = mine.filter(function(p){ return p && p.stage === "loi" && !(window.isDNC && isDNC(p)); });
+    loi.sort(function(a,b){ return (a.lastContact||0) - (b.lastContact||0); }); // quietest first
+    if(loi.length){
+      wrap.appendChild(head("LOI out \u2014 keep warm", loi.length));
+      wrap.appendChild(e("div",{class:"muted",style:"font-size:12px;margin:-2px 0 8px"},
+        "Offer is out. Stay in touch so it doesn't go cold."));
+      var lp = e("div",{class:"intel-panel"});
+      loi.forEach(function(p){
+        var quiet = p.lastContact ? Math.floor((Date.now() - p.lastContact) / 86400000) : null;
+        var since = p.loiOutDate ? Math.floor((Date.now() - p.loiOutDate) / 86400000) : null;
+        var bits = [];
+        if(since != null) bits.push("LOI out " + since + "d ago");
+        bits.push(quiet == null ? "no contact logged" : ("last contact " + quiet + "d ago"));
+        lp.appendChild(e("button",{class:"intel-row",onClick:function(){ navigate("prospect:"+p.id); }},
+          e("div",{class:"intel-rank k-warn"}, htmlNode(intelKindIcon("warn"))),
+          e("div",{class:"intel-main"},
+            e("div",{class:"intel-name"}, (p.firstName||"") + " " + (p.lastName||""),
+              p.company ? e("span",{class:"intel-co"}, " \u00B7 " + p.company) : null),
+            e("div",{class:"intel-reason"}, bits.join(" \u00B7 "))
+          ),
+          (quiet != null && quiet >= 3) ? e("span",{class:"pill bad",style:"flex:0 0 auto"}, "going quiet") : null
+        ));
+      });
+      wrap.appendChild(lp);
+    }
+
+    // ---- WAITING ON US: the LinkedIn/first-text gates ----
+    var gates = mine.filter(function(p){
+      return p && (p.stage === "waiting-first-text" || p.stage === "waiting-li-send") && !(window.isDNC && isDNC(p));
+    });
+    if(gates.length){
+      wrap.appendChild(head("Waiting on us", gates.length));
+      var gp2 = e("div",{class:"intel-panel"});
+      gates.forEach(function(p){
+        var q = (window.STAGE_GATES && window.STAGE_GATES[p.stage]) ? window.STAGE_GATES[p.stage].q : getStageLabel(p.stage);
+        gp2.appendChild(e("button",{class:"intel-row",onClick:function(){ navigate("prospect:"+p.id); }},
+          e("div",{class:"intel-rank k-info"}, htmlNode(intelKindIcon("info"))),
+          e("div",{class:"intel-main"},
+            e("div",{class:"intel-name"}, (p.firstName||"") + " " + (p.lastName||""),
+              p.company ? e("span",{class:"intel-co"}, " \u00B7 " + p.company) : null),
+            e("div",{class:"intel-reason"}, q)
+          )
+        ));
+      });
+      wrap.appendChild(gp2);
+    }
+
+    // ---- Calls set — closing checklist ----
     var callsSet = mine.filter(function(p){ return hasCallScheduled(p) && p.stage !== "closed"; });
     callsSet.sort(function(a,b){ return closingProgress(a).done - closingProgress(b).done; }); // least progress first
     if(callsSet.length){
-      wrap.appendChild(e("div",{class:"wn-group-head"},
-        e("h3",{}, "Calls set — closing checklist"),
-        e("span",{class:"wn-count"}, String(callsSet.length))
-      ));
+      wrap.appendChild(head("Calls set \u2014 closing checklist", callsSet.length));
       var csp = e("div",{class:"intel-panel"});
       callsSet.forEach(function(p){ csp.appendChild(callsSetRow(p)); });
       wrap.appendChild(csp);
     }
-
-    // Keep-warm categories — everyone in these stages gets a daily touch, grouped on their own.
-    KEEPWARM_STAGES.forEach(function(stageId){
-      var grp = keepWarmGroup(mine, stageId);
-      if(!grp.length) return;
-      var label = (typeof getStageLabel === "function") ? getStageLabel(stageId) : stageId;
-      wrap.appendChild(e("div",{class:"wn-group-head"},
-        e("h3",{}, label + " — keep warm today"),
-        e("span",{class:"wn-count"}, String(grp.length))
-      ));
-      var gp = e("div",{class:"intel-panel"});
-      grp.forEach(function(p){ gp.appendChild(keepWarmRow(p)); });
-      wrap.appendChild(gp);
-    });
 
     return wrap;
   };
@@ -28247,7 +28328,7 @@ if(params.get("u") && params.get("pin")){
 <script>
 (function(){
   "use strict";
-  window.__ROS_BUILD = "Build 2026-07-29R \u2014 10-day research expiry (Closed/Nurture)";
+  window.__ROS_BUILD = "Build 2026-07-29S \u2014 pink webinar leads + Work Now sections";
   try { console.log("[RecruitOS] " + window.__ROS_BUILD); } catch(e){}
   if(typeof window.viewSettings === "function"){
     var _vs = window.viewSettings;
@@ -28605,7 +28686,7 @@ if(params.get("u") && params.get("pin")){
           var strip = e("div",{class:"fn-strip"});
           ppl.slice(0, 30).forEach(function(p){
             var ini = ((p.firstName||"?").charAt(0) + (p.lastName||"").charAt(0)).toUpperCase();
-            strip.appendChild(e("div",{class:"fn-chip",onClick:function(){ navigate("prospect:" + p.id); }},
+            strip.appendChild(e("div",{class:"fn-chip" + ((window.isWebinarLead && window.isWebinarLead(p)) ? " wl-pink" : ""),onClick:function(){ navigate("prospect:" + p.id); }},
               e("span",{class:"av"}, ini),
               e("span",{}, (p.firstName||"") + " " + (p.lastName||""))
             ));
@@ -29298,6 +29379,144 @@ if(params.get("u") && params.get("pin")){
       tries++;
       if(runExpiry() || tries > 60) clearInterval(iv);
     }, 900);
+  })();
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — WEBINAR LEAD IDENTITY (soft pink)
+     A webinar lead is marked for life. Their prospect card is
+     soft pink wherever it appears — board, stage full-screen,
+     holding area, funnel chips — so you can always see where
+     they came from, even long after they've been promoted into
+     the pipeline and moved through the stages.
+     ============================================================ -->
+<style>
+  /* soft pink card */
+  .k-card.wl-pink{
+    background:linear-gradient(180deg, #fdf2f8 0%, #fce7f3 100%);
+    border-color:#f9a8d4;
+  }
+  .k-card.wl-pink:hover{ border-color:#ec4899; }
+  .k-card.wl-pink .kc-name{ color:#831843; }
+  .k-card.wl-pink .kc-meta, .k-card.wl-pink .kc-added{ color:#9d5c7c; }
+  .wl-badge{
+    display:inline-block;font-size:9.5px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;
+    color:#a21caf;background:rgba(217,70,239,.13);border:1px solid rgba(217,70,239,.32);
+    border-radius:999px;padding:1px 7px;margin-top:6px;
+  }
+  /* pink chip in the funnel strip */
+  .fn-chip.wl-pink{ background:#fdf2f8; border-color:#f9a8d4; }
+  .fn-chip.wl-pink .av{ background:rgba(217,70,239,.15); color:#a21caf; }
+  /* pink pill on the prospect detail hero */
+  .pd-wl-pill{
+    font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
+    color:#a21caf;background:rgba(217,70,239,.12);border:1px solid rgba(217,70,239,.35);
+    border-radius:999px;padding:2px 9px;
+  }
+</style>
+<script>
+(function(){
+  "use strict";
+
+  // A webinar lead is identified durably: an explicit flag, a Webinar source,
+  // or an origin in the webinar holding list. Survives promotion and every
+  // later stage move.
+  window.isWebinarLead = function(p){
+    if(!p) return false;
+    if(p.webinarLead === true) return true;
+    if(String(p.source || "").toLowerCase() === "webinar") return true;
+    if(p.originStage && window.isHoldingStage && window.isHoldingStage(p.originStage)) return true;
+    if(p.stage && window.isHoldingStage && window.isHoldingStage(p.stage)) return true;
+    return false;
+  };
+
+  // Cards: soft pink + a WEBINAR badge.
+  if(typeof window.kanbanCard === "function"){
+    var _kc = window.kanbanCard;
+    window.kanbanCard = function(p){
+      var card = _kc.apply(this, arguments);
+      try{
+        if(card && window.isWebinarLead(p)){
+          card.classList.add("wl-pink");
+          if(!card.querySelector(".wl-badge")) card.appendChild(e("div",{class:"wl-badge"}, "Webinar"));
+        }
+      }catch(err){}
+      return card;
+    };
+  }
+
+  // Prospect detail hero: a pink WEBINAR LEAD pill next to the stage pill.
+  if(typeof window.viewProspectDetail === "function"){
+    var _vpd = window.viewProspectDetail;
+    window.viewProspectDetail = function(p){
+      var v = _vpd.apply(this, arguments);
+      try{
+        if(window.isWebinarLead(p)){
+          var pill = v.querySelector(".pd-hero .stage-pill");
+          if(pill && pill.parentNode && !pill.parentNode.querySelector(".pd-wl-pill")){
+            pill.parentNode.insertBefore(e("span",{class:"pd-wl-pill"},"Webinar lead"), pill.nextSibling);
+          }
+        }
+      }catch(err){}
+      return v;
+    };
+  }
+
+  // Mark on creation (the + Webinar lead button) so the flag is permanent.
+  if(typeof window.addWebinarLead === "function"){
+    var _awl = window.addWebinarLead;
+    window.addWebinarLead = function(){
+      window._pendingWebinarFlag = true;
+      return _awl.apply(this, arguments);
+    };
+  }
+  if(typeof window.openProspectModal === "function"){
+    var _opm = window.openProspectModal;
+    window.openProspectModal = function(existing, opts){
+      var r = _opm.apply(this, arguments);
+      // Flag gets stamped on save by the persist hook below; clear the intent
+      // marker once the modal has been opened for a non-webinar add.
+      if(!(opts && String(opts.source||"").toLowerCase() === "webinar")) window._pendingWebinarFlag = false;
+      return r;
+    };
+  }
+
+  // Durable stamping + backfill: anything sourced Webinar, or sitting in /
+  // originating from the holding list, gets the permanent flag.
+  function stampAll(){
+    var n = 0;
+    (state.prospects || []).forEach(function(p){
+      if(!p || p.webinarLead === true) return;
+      var src = String(p.source || "").toLowerCase() === "webinar";
+      var held = p.stage && window.isHoldingStage && window.isHoldingStage(p.stage);
+      var from = p.originStage && window.isHoldingStage && window.isHoldingStage(p.originStage);
+      if(src || held || from){ p.webinarLead = true; n++; }
+    });
+    return n;
+  }
+  window.__stampWebinarLeads = stampAll;
+
+  // Keep the flag applied as leads are added/promoted (runs on every save).
+  if(typeof window.persist === "function"){
+    var _pp = window.persist;
+    window.persist = function(){
+      try{ stampAll(); }catch(err){}
+      return _pp.apply(this, arguments);
+    };
+  }
+
+  (function schedule(){
+    var tries = 0;
+    var iv = setInterval(function(){
+      tries++;
+      try{
+        if(state && state.user){
+          clearInterval(iv);
+          if(stampAll()) persist();
+        } else if(tries > 60){ clearInterval(iv); }
+      }catch(err){ clearInterval(iv); }
+    }, 800);
   })();
 })();
 </script>
