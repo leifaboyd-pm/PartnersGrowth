@@ -14683,15 +14683,39 @@ refreshAll = function() {
 
     // Anonymous sign-in so Firestore rules can require auth without forcing email/password yet.
     // Enable Anonymous in Firebase Console → Authentication → Sign-in method.
-    signInAnonymously(auth).catch(err => {
-      console.warn("[firebase] anonymous sign-in failed — check Auth providers in Firebase Console", err);
-    });
+    // RESILIENCE: a failed sign-in used to fail ONCE, silently — and every save
+    // on that device would then hang forever waiting for auth. Now: retry with
+    // backoff, record the result where the Sync Health panel can show it.
+    window._syncDiag = window._syncDiag || {};
+    (function trySignIn(attempt){
+      signInAnonymously(auth).then(() => {
+        window._syncDiag.auth = "ok";
+      }).catch(err => {
+        window._syncDiag.auth = "FAILED: " + (err && (err.code || err.message) || "unknown");
+        console.warn("[firebase] anonymous sign-in failed (attempt " + attempt + ") — check Auth providers/authorized domains in Firebase Console", err);
+        if(attempt < 8) setTimeout(() => trySignIn(attempt + 1), Math.min(30000, 3000 * attempt));
+      });
+    })(1);
 
     onAuthStateChanged(auth, user => {
       window._fb = window._fb || {};
       window._fb.user = user;
-      if (user) window.dispatchEvent(new CustomEvent("firebase-auth-ready"));
+      if (user){ window._syncDiag.auth = "ok \u00B7 " + (user.uid || "").slice(0,8); window.dispatchEvent(new CustomEvent("firebase-auth-ready")); }
     });
+
+    // Wait for auth with a TIMEOUT — never hang a save forever on a sign-in
+    // that isn't coming. Callers get a labeled error they can surface.
+    window.__awaitAuth = function(fb, ms){
+      return new Promise((res, rej) => {
+        if(fb && fb.user) return res(fb.user);
+        let done = false;
+        const t = setTimeout(() => { if(done) return; done = true;
+          rej(new Error("Not signed in to sync (auth timeout) — see Settings \u2192 Sync health")); }, ms || 10000);
+        window.addEventListener("firebase-auth-ready", () => {
+          if(done) return; done = true; clearTimeout(t); res(window._fb && window._fb.user);
+        }, { once:true });
+      });
+    };
 
     window._fb = {
       ready: true,
@@ -14921,7 +14945,6 @@ const DEFAULT_CADENCE_TEMPLATES = {
     name: "Loan Officer Cadence",
     description: "8-step multi-channel sequence for net-new LO recruits. Spaces touches strategically, includes a pricing & platform overview at Day 10.",
     steps: [
-      { id:"s1", day:1,  channel:"linkedin-message", action:"Send LinkedIn connection request",      prompt:"Send a connection request with a personalized note. Lead with one specific thing about them — recent post, role, milestone — not a pitch. The connection request itself is the first touch.", short:"LinkedIn connect" },
       { id:"s2", day:2,  channel:"linkedin-engage",  action:"Engage on a recent post",                prompt:"Find a recent post and leave a thoughtful comment or meaningful like. No pitch." },
       { id:"s3", day:3,  channel:"sms",              action:"Personalized first text",                prompt:"Reference something specific from their profile or post. Under 3 sentences." },
       { id:"s4", day:5,  channel:"voice-note",       action:"30-second recruiter voice note",         prompt:"Voice notes cut through. Mention them by name and one thing you noticed." },
@@ -14942,7 +14965,6 @@ const DEFAULT_CADENCE_TEMPLATES = {
     name: "Branch Manager Cadence",
     description: "9-step extended sequence for BM recruits. Adds a pro forma walkthrough at Day 18 — the make-or-break conversation for a branch move.",
     steps: [
-      { id:"s1", day:1,  channel:"linkedin-message", action:"Send LinkedIn connection request",      prompt:"Send a connection request with a personalized note. BMs respond to peer-to-peer tone — reference their leadership role, recent branch news, or production milestone. Don't pitch.", short:"LinkedIn connect" },
       { id:"s2", day:2,  channel:"linkedin-engage",  action:"Engage on a recent post",                prompt:"Find a recent post and leave a thoughtful comment or meaningful like. No pitch." },
       { id:"s3", day:3,  channel:"sms",              action:"Personalized first text",                prompt:"Reference something specific. BMs respond to peer-to-peer tone, not recruiter-speak." },
       { id:"s4", day:5,  channel:"voice-note",       action:"30-second recruiter voice note",         prompt:"Voice notes cut through. Reference their leadership role specifically." },
@@ -15615,7 +15637,7 @@ const db = {
     setCloudStatus("syncing");
     try{
       // Wait for auth before writing — otherwise rules requiring auth will reject
-      if(!fb.user) await new Promise(res => window.addEventListener("firebase-auth-ready", res, { once: true }));
+      if(!fb.user) await window.__awaitAuth(fb, 10000);
       const ref = fb.doc(fb.fdb, ...FS_DOC_PATH);
       // SAFETY GUARD: never let a much-smaller dataset overwrite a larger real
       // one in the cloud. This stops a stale/partial copy (or a bad migration)
@@ -15648,9 +15670,13 @@ const db = {
         let bytes = sizeOf(safe);
         const LIMIT = 900000;
         if(bytes > LIMIT && Array.isArray(safe.prospects)){
+          // Stage 1: strip debug/raw bulk from every research copy — AI
+          // transcripts, failed-attempt raw dumps, photo candidate lists,
+          // and source URL lists. All the actionable research survives.
           safe = { ...safe, prospects: safe.prospects.map(p => {
-            if(p && p.research && (p.research.logEntry || p.research.photoCandidates)){
-              const r = { ...p.research }; delete r.logEntry; delete r.photoCandidates;
+            if(p && p.research){
+              const r = { ...p.research };
+              delete r.logEntry; delete r.photoCandidates; delete r.errorDetails; delete r.sources;
               return { ...p, research: r };
             }
             return p;
@@ -15666,6 +15692,28 @@ const db = {
             bytes = sizeOf(safe); trimmedActs = true;
           }
         });
+        if(bytes > LIMIT && Array.isArray(safe.prospects)){
+          // Stage 3 (last resort before failing): hard-slim each research
+          // dossier in the CLOUD COPY to its essentials. Contact fields are
+          // already applied to the prospect itself, so nothing actionable is
+          // lost; the device that ran the research keeps the full dossier.
+          safe = { ...safe, prospects: safe.prospects.map(p => {
+            if(p && p.research && !p.research._slim){
+              const r = p.research;
+              return { ...p, research: {
+                _slim: true,
+                summary: r.summary || null,
+                error: r.error || null,
+                linkedinConfidence: r.linkedinConfidence || null,
+                valueScore: r.valueScore && r.valueScore.composite != null ? { composite: r.valueScore.composite } : null,
+                researchedAt: r.researchedAt || null
+              } };
+            }
+            return p;
+          }) };
+          bytes = sizeOf(safe);
+          if(bytes <= LIMIT) console.log("[cloud] hard-slimmed research dossiers in the cloud copy to fit the 1MB limit (" + Math.round(bytes/1024) + "KB)");
+        }
         if(bytes > LIMIT){
           console.warn("[cloud] snapshot still " + Math.round(bytes/1024) + "KB after slimming");
           if(!window._sizeWarned){ window._sizeWarned = true;
@@ -15677,9 +15725,13 @@ const db = {
         }
       }catch(e){}
       await fb.setDoc(ref, safe);
+      window._syncDiag = window._syncDiag || {};
+      window._syncDiag.lastPushAt = Date.now(); window._syncDiag.lastPushErr = null;
       setCloudStatus("synced");
     } catch(err){
       console.warn("[cloud] write failed", err);
+      window._syncDiag = window._syncDiag || {};
+      window._syncDiag.lastPushErr = String((err && (err.code || err.message)) || err);
       setCloudStatus("error", err);
       // Make a size-limit failure loud instead of silent.
       if(/longer than|1048576|exceeds maximum|too large/i.test(String((err && err.message) || "")) && typeof showToast === "function"){
@@ -15693,7 +15745,7 @@ const db = {
     const fb = await window._fbReady;
     if(!fb){ setCloudStatus("offline"); return null; }
     try{
-      if(!fb.user) await new Promise(res => window.addEventListener("firebase-auth-ready", res, { once: true }));
+      if(!fb.user) await window.__awaitAuth(fb, 10000);
       const ref = fb.doc(fb.fdb, ...FS_DOC_PATH);
       const snap = await fb.getDoc(ref);
       if(snap.exists()){ setCloudStatus("synced"); return snap.data(); }
@@ -15708,7 +15760,7 @@ const db = {
   async uploadPhoto(prospectId, fileOrBlob){
     const fb = await window._fbReady;
     if(!fb) throw new Error("Cloud offline — cannot upload photo");
-    if(!fb.user) await new Promise(res => window.addEventListener("firebase-auth-ready", res, { once: true }));
+    if(!fb.user) await window.__awaitAuth(fb, 10000);
     const path = `prospect-photos/${prospectId}-${Date.now()}.jpg`;
     const r = fb.ref(fb.stg, path);
     await fb.uploadBytes(r, fileOrBlob, { contentType: fileOrBlob.type || "image/jpeg" });
@@ -15718,7 +15770,7 @@ const db = {
   async uploadUserPhoto(userId, fileOrBlob){
     const fb = await window._fbReady;
     if(!fb) throw new Error("Cloud offline — cannot upload photo");
-    if(!fb.user) await new Promise(res => window.addEventListener("firebase-auth-ready", res, { once: true }));
+    if(!fb.user) await window.__awaitAuth(fb, 10000);
     const path = `user-photos/${userId}-${Date.now()}.jpg`;
     const r = fb.ref(fb.stg, path);
     await fb.uploadBytes(r, fileOrBlob, { contentType: fileOrBlob.type || "image/jpeg" });
@@ -15729,7 +15781,7 @@ const db = {
   async uploadFile(prospectId, file){
     const fb = await window._fbReady;
     if(!fb) throw new Error("Cloud offline — cannot upload file");
-    if(!fb.user) await new Promise(res => window.addEventListener("firebase-auth-ready", res, { once: true }));
+    if(!fb.user) await window.__awaitAuth(fb, 10000);
     const safeName = file.name.replace(/[^\w.\-]/g, "_");
     const path = `prospect-files/${prospectId}/${Date.now()}-${safeName}`;
     const r = fb.ref(fb.stg, path);
@@ -15746,7 +15798,7 @@ const db = {
   async uploadLibraryVideo(file, onProgress){
     const fb = await window._fbReady;
     if(!fb) throw new Error("Cloud offline — cannot upload video");
-    if(!fb.user) await new Promise(res => window.addEventListener("firebase-auth-ready", res, { once: true }));
+    if(!fb.user) await window.__awaitAuth(fb, 10000);
     const safeName = (file.name || "video.mp4").replace(/[^\w.\-]/g, "_");
     const path = `library-videos/${Date.now()}-${safeName}`;
     const r = fb.ref(fb.stg, path);
@@ -15800,8 +15852,11 @@ async function syncFromCloudOnBoot(){
   // PROSPECTS MERGE by id (tombstone-aware): protects both directions —
   // a device coming online neither loses teammates' additions nor bulldozes
   // them with its own whole list.
+  if(Array.isArray(cloud.expiredActs) && cloud.expiredActs.length){
+    state.expiredActs = Array.from(new Set((state.expiredActs || []).concat(cloud.expiredActs))).slice(-1000);
+  }
   const bootMerged = (typeof window.__rosMerge === "function")
-    ? window.__rosMerge(state.prospects || [], cloud.prospects || [], state.deletedIds || [], cloud.deletedIds || [])
+    ? window.__rosMerge(state.prospects || [], cloud.prospects || [], state.deletedIds || [], cloud.deletedIds || [], cloudTime > localTime)
     : null;
 
   if(cloudTime > localTime){
@@ -15809,7 +15864,7 @@ async function syncFromCloudOnBoot(){
     state.prospects        = bootMerged ? bootMerged.list : (cloud.prospects || []);
     if(bootMerged) state.deletedIds = bootMerged.deleted;
     state.activities       = (typeof window.__rosMergeActs === "function")
-      ? window.__rosMergeActs(state.activities || [], cloud.activities || [], bootMerged ? bootMerged.deleted : [])
+      ? window.__rosMergeActs(state.activities || [], cloud.activities || [], (bootMerged ? bootMerged.deleted : []).concat(state.expiredActs || []))
       : (cloud.activities || []);
     state.users            = cloud.users            || USERS.slice();
     state.cadenceTemplates = cloud.cadenceTemplates || null;
@@ -15837,7 +15892,7 @@ async function syncFromCloudOnBoot(){
     // Local is newer — but push the MERGED union, never just the local list,
     // so prospects that only exist in the cloud aren't bulldozed.
     if(bootMerged){ state.prospects = bootMerged.list; state.deletedIds = bootMerged.deleted; }
-    if(typeof window.__rosMergeActs === "function") state.activities = window.__rosMergeActs(state.activities || [], cloud.activities || [], bootMerged ? bootMerged.deleted : []);
+    if(typeof window.__rosMergeActs === "function") state.activities = window.__rosMergeActs(state.activities || [], cloud.activities || [], (bootMerged ? bootMerged.deleted : []).concat(state.expiredActs || []));
     if(typeof window.__rosCacheSync === "function") window.__rosCacheSync(state.prospects);
     db.pushToCloud(stateToPersist());
   } else {
@@ -16259,7 +16314,7 @@ function render(){
   else if(state.screen.startsWith("prospect:")){
     const p = state.prospects.find(x => x.id === state.screen.split(":")[1]);
     if(p){ title = `${p.firstName} ${p.lastName}`; main.appendChild(viewProspectDetail(p)) }
-    else  { title = "Not found";                   main.appendChild(viewNotFound()) }
+    else  { title = "Command Center"; state.screen = "dashboard"; main.appendChild(viewDashboard()) } // deleted/unknown prospect → land home
   }
   else if(state.screen.startsWith("cadence-editor:")){
     const id = state.screen.split(":")[1];
@@ -16274,7 +16329,14 @@ function render(){
   else if(state.screen === "import-export") { title = "Import / Export"; main.appendChild(viewImportExport()) }
   else if(state.screen === "reports")       { title = "Reports";         main.appendChild(viewReports()) }
   else if(state.screen === "roadmap")       { title = "Roadmap";         main.appendChild(viewRoadmap()) }
-  else                                      { main.appendChild(viewNotFound()) }
+  else if(state.screen === "webinar"){ title = "Webinar Leads"; main.appendChild(window.viewWebinarLeads ? window.viewWebinarLeads() : e("div",{class:"muted"},"Loading\u2026")); }
+  else if(state.screen && state.screen.startsWith("stage:")){
+    const sid = state.screen.slice(6);
+    const stg = getStages().find(s => s.id === sid);
+    title = stg ? stg.label : "Pipeline";
+    main.appendChild(window.viewStageFull ? window.viewStageFull(sid) : viewProspects());
+  }
+  else                                      { title = "Command Center"; state.screen = "dashboard"; main.appendChild(viewDashboard()) } // unknown screens land home, never a blank dead end
 
   $("#tb-title").textContent = title;
   syncRailActive();
@@ -16697,6 +16759,9 @@ function renderProspectBody(mount){
 
 const STAGE_COLORS = {
   new:     "#64748b",   // slate — not yet worked
+  "waiting-first-text":"#6366f1",  // indigo — we owe them the first text
+  "waiting-li-send":"#0ea5e9",     // sky — we owe the connection request
+  "awaiting-li-accept":"#8b5cf6",  // violet — waiting on them
   engaging:"#0891b2",   // cyan — cadence running / outreach
   engaged: "#00818B",   // Partners teal — actively working the checklist
   deep:    "#2563eb",   // blue — deeper dive
@@ -16711,6 +16776,7 @@ function renderKanban(arr){
   const isTouch = ("ontouchstart" in window) || (navigator.maxTouchPoints > 0);
   getStages().forEach(stageObj => {
     const stage = stageObj.id;
+    if(window.isHoldingStage && window.isHoldingStage(stage)) return;  // Webinar Leads live outside the pipeline
     const items = arr.filter(p => p.stage === stage);
     const col = e("div",{class:"kanban-col",data:{stage}});
     col.style.setProperty("--stage", stageColor(stage));
@@ -16751,10 +16817,12 @@ function renderKanban(arr){
         if(!prospect || prospect.stage === newStage) return;
         const oldStage = prospect.stage;
         prospect.stage = newStage;
+        prospect.stageEnteredAt = Date.now();
         // Keep the weekly report in lockstep with the pipeline: landing in
         // LOI Out / Closed stamps the date fields the report sections key on.
         if(newStage === "loi" && !prospect.loiOutDate) prospect.loiOutDate = Date.now();
         if(newStage === "closed" && !prospect.hireDate) prospect.hireDate = Date.now();
+        if(newStage === "engaged" && typeof window.safeSwitchToPlaybook === "function") safeSwitchToPlaybook(prospect);
         logActivity(prospect.id, "stage-change", `${oldStage} → ${newStage}`);
         persist();
         showToast(`Moved to ${newStage}`);
@@ -17319,7 +17387,7 @@ function viewProspectDetail(p){
 
   // Tabs
   const tabs = e("div",{class:"pd-tabs"});
-  const TABS = ["Playbook","Research","Overview","Activity","Notes","Files"];
+  const TABS = ["Playbook","Research","Text generation","Overview","Activity","Notes","Files"];
   // Tab choice is LOCAL UI state — kept off the synced record so a cloud
   // merge replacing this prospect can't yank the user back to Playbook.
   window._pdTabs = window._pdTabs || {};
@@ -17337,6 +17405,7 @@ function viewProspectDetail(p){
 
   if(activeTab === "Playbook")  wrap.appendChild(pdPlaybook(p));
   if(activeTab === "Research")  wrap.appendChild(pdResearch(p));
+  if(activeTab === "Text generation") wrap.appendChild(window.pdTextGen ? window.pdTextGen(p) : e("div",{class:"muted"},"Loading\u2026"));
   if(activeTab === "Overview")  wrap.appendChild(pdOverview(p));
   if(activeTab === "Activity")  wrap.appendChild(pdActivity(p));
   if(activeTab === "Notes")     wrap.appendChild(pdNotes(p));
@@ -17908,10 +17977,12 @@ function stageSelect(p){
   const sel = e("select",{onChange:ev=>{
     const old = p.stage;
     p.stage = ev.target.value;
+    p.stageEnteredAt = Date.now();
     // Same report-field stamping as drag-and-drop, so every path to
     // LOI/Closed keeps the weekly report in lockstep.
     if(p.stage === "loi" && !p.loiOutDate) p.loiOutDate = Date.now();
     if(p.stage === "closed" && !p.hireDate) p.hireDate = Date.now();
+    if(p.stage === "engaged" && typeof window.safeSwitchToPlaybook === "function") safeSwitchToPlaybook(p);
     logActivity(p.id,"stage-change",`Stage: ${getStageLabel(old)} → ${getStageLabel(p.stage)}`);
     persist();
     showToast("Stage updated");
@@ -18009,6 +18080,23 @@ function pdNotes(p){
       })()
     )
   ));
+  // Attachments — same storage as the Files tab (p.files), surfaced here so
+  // supporting documents (PDF, Word, etc.) live right next to the notes.
+  if(!p.files) p.files = [];
+  const isViewer = state.user.role === "viewer";
+  const att = e("div",{class:"card",style:"margin-top:12px"});
+  att.appendChild(e("label",{style:"font-size:12px;color:var(--t-2);display:block;margin-bottom:6px"},"Attachments"));
+  if(p.files.length){
+    p.files.forEach(f => att.appendChild(renderFileRow(p, f, isViewer)));
+  } else {
+    att.appendChild(e("div",{class:"muted",style:"font-size:12.5px;margin:2px 0 8px"},"No files yet."));
+  }
+  if(!isViewer){
+    att.appendChild(e("button",{class:"btn sm",style:"margin-top:8px",onClick:()=>{
+      pickMultipleFiles(files => uploadFilesToProspect(p, files));
+    }}, "\u2191 Upload PDF / Word doc"));
+  }
+  wrap.appendChild(e("div",{class:"pd-section"}, att));
   return wrap;
 }
 
@@ -18301,7 +18389,7 @@ async function runResearch(p, opts = {}){
       model: CONFIG.anthropicModel,
       system: RESEARCH_SYSTEM_PROMPT + voicePromptSegment(state.user),
       maxTokens: 8192,
-      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 3 }],
+      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8 }],
       timeoutMs: 180000,
       onProgress: (entry) => { p._researchEntry = entry; }
     });
@@ -18320,7 +18408,7 @@ async function runResearch(p, opts = {}){
       const parseErr = reason ? " — " + reason : "";
       p.research = {
         error: "AI response wasn't valid JSON" + parseErr,
-        errorDetails: rawText.slice(0, 12000),
+        errorDetails: rawText.slice(0, 1200),
         failedAt: Date.now(),
         modelUsed: CONFIG.anthropicModel,
         truncated: wasTruncated,
@@ -18358,7 +18446,7 @@ async function runResearch(p, opts = {}){
     if(!p.research || !p.research.error){
       p.research = {
         error: err.message || "Unknown error",
-        errorDetails: rawText ? rawText.slice(0, 12000) : "",
+        errorDetails: rawText ? rawText.slice(0, 1200) : "",
         failedAt: Date.now(),
         modelUsed: CONFIG.anthropicModel,
         logEntry: p._researchEntry ? (function(l){ try{ var c = sanitizeLogForExport(l); var j = JSON.stringify(c); return j.length > 4000 ? { error: c && c.error, phase: c && c.phase, truncated: true } : c; }catch(e){ return null; } })(p._researchEntry) : null
@@ -18429,11 +18517,22 @@ Partners Mortgage's brand values are: Integrity, Solutions, Relationships, Dilig
 
 Use web_search aggressively. Search LinkedIn, the prospect's current company website, Scotsman Guide, mortgage industry news, and any other public source. Cite every claim. If you can't find evidence for something, say so honestly — never fabricate scores, production numbers, or quotes.
 
+TOP PRIORITY — FIND THEIR LINKEDIN PROFILE URL. This is the single most important field in the entire dossier; the recruiting workflow depends on it. Spend your first searches on this and do not give up after one attempt. Work the variations:
+- "<first> <last>" linkedin <current company>
+- "<first> <last>" linkedin mortgage <city or state>
+- site:linkedin.com/in "<first> <last>" <company OR "loan officer" OR "branch manager">
+- nickname/short forms (Mike/Michael, Bob/Robert, Kate/Katherine), maiden or hyphenated surnames, middle initials
+- their NMLS number, company team page, or Scotsman Guide listing — these pages often link straight to LinkedIn
+Verify the profile is the RIGHT person by cross-checking employer, market/city, or title. Return the canonical URL form https://www.linkedin.com/in/<slug> (strip tracking parameters). If more than one plausible profile exists, put the best in profile.linkedin and list the rest in linkedinCandidates. Only use null if you genuinely exhausted these approaches — and then say what you tried in linkedinNotes.
+
 Reply with raw JSON only. Do NOT wrap your response in code fences (no \`\`\`json or \`\`\`). Do NOT add a preamble or postamble. The very first character of your response must be { and the very last character must be }. Schema:
 
 {
   "photoCandidates": ["public image URLs in order of likely accuracy"],
   "profile": {"company":"current employer or null", "market":"city, state or null", "nmls":"NMLS number, digits only, or null", "linkedin":"full LinkedIn profile URL or null", "instagram":"Instagram handle (with @) or full profile URL, or null", "position":"Loan Officer|Senior Loan Officer|Branch Manager|Area Manager or null", "phone":"or null", "email":"or null"},
+  "linkedinConfidence": "high|medium|low|not-found — how sure you are that profile.linkedin is THIS person",
+  "linkedinCandidates": ["other plausible LinkedIn profile URLs, best first"],
+  "linkedinNotes": "if not found: exactly which searches/variations you tried, so a human can pick up the trail",
   "summary": "2-3 sentence executive summary of who this person is and why they'd consider Partners",
   "timeline": [{"employer":"", "title":"", "startYear":2019, "endYear":2024, "location":""}],
   "productionEstimate": {"volume":"$25M annually or null", "units":"~80 loans or null", "branchVolume":"or null", "notes":"how you derived these numbers"},
@@ -18457,6 +18556,7 @@ Reply with raw JSON only. Do NOT wrap your response in code fences (no \`\`\`jso
 }
 
 Rules:
+- LinkedIn is ESSENTIAL. Exhaust the search strategies above before returning null for it, and always set linkedinConfidence. A verified LinkedIn URL is worth more than any other single field in this dossier.
 - profile: fill each field ONLY from public evidence (LinkedIn, NMLS Consumer Access, company site, and public social profiles such as Instagram). Use null for anything you can't verify. NMLS must be digits only. For instagram, prefer the @handle.
 - Outreach messages MUST reference specific details from your research. No generic recruiter language.
 - Lead with relationships and operational support, not comp. Partners doesn't outbid; they outserve.
@@ -18483,7 +18583,8 @@ function buildResearchPrompt(p){
     p.pain      ? `Recruiter's pain hypothesis (verify or refute): ${p.pain}` : null,
     p.motivator ? `Recruiter's motivator hypothesis (verify or refute): ${p.motivator}` : null,
     "",
-    "Search the web for their LinkedIn profile, company team page, any industry rankings or news, social posts. Build the dossier. Reply with the JSON object only."
+    "PRIMARY OBJECTIVE: find this person's LinkedIn profile URL and verify it is really them (match employer, market, or title). Try name variations, nicknames, maiden/hyphenated surnames, and search their NMLS number, company team page, or Scotsman Guide listing — those pages often link straight to LinkedIn. Set linkedinConfidence, and if you truly cannot find it, record what you tried in linkedinNotes.",
+    "Then: company team page, industry rankings or news, social posts, production signals. Build the dossier. Reply with the JSON object only."
   ].filter(Boolean);
   return lines.join("\n");
 }
@@ -23216,16 +23317,17 @@ function viewRoadmap(){
 /* ===========================================================================
    ADD/EDIT PROSPECT MODAL
    =========================================================================== */
-function openProspectModal(existing){
+function openProspectModal(existing, opts){
+  opts = opts || {};
   const p = existing || {
     id:"p_"+uid(), firstName:"", lastName:"", company:"", market:"", nmls:"",
     position:"", phone:"", email:"", linkedin:"", instagram:"",
-    source:"Manual", assignedTo:state.user.id, stage:"new",
+    source: opts.source || "Manual", assignedTo:state.user.id, stage: opts.defaultStage || "new",
     lastContact:null, nextFollowup:null, notes:"", tags:[], pain:"", motivator:"",
     estProduction:0, productionTier:"Unknown", engagement:0, appointmentStatus:"none",
     createdAt: Date.now()
   };
-  showModal(existing?"Edit prospect":"Add prospect", (modal,close)=>{
+  showModal(existing ? "Edit prospect" : (opts.title || "Add prospect"), (modal,close)=>{
     const grid = e("div",{class:"form-grid two"});
     function fld(label,inp){ return e("div",{},e("label",{},label),inp) }
     const fn  = e("input",{value:p.firstName,placeholder:"First"});
@@ -23336,6 +23438,7 @@ function openProspectModal(existing){
         p.hireDate   = hireDate.value ? new Date(hireDate.value + "T12:00:00").getTime() : null;
         // Auto-stamp hireDate if stage moved to Closed/Joined and they didn't set one
         if(p.stage === STAGE_CLOSED && !p.hireDate) p.hireDate = Date.now();
+        if(opts.pin) p.stagePinned = true;   // webinar leads stay put until moved by hand
         if(!existing) state.prospects.push(p);
         if(!existing && typeof queueAutoResearch === "function") queueAutoResearch(p);
         ensureReportingFields(p);
@@ -25239,10 +25342,16 @@ if(params.get("u") && params.get("pin")){
     const allowed = {};
     (typeof getStages === "function" ? getStages() : []).forEach(function(s){
       if(!s) return;
-      if(s.id === "engaging" || s.id === "engaged" || /webinar/i.test(String(s.label||""))) allowed[s.id] = true;
+      if(s.id === "engaging" || s.id === "engaged") allowed[s.id] = true;
     });
     const mine = state.prospects.slice(); // shared team pipeline — everyone sees all
-    const list = mine
+    // Gate stages = an action is owed by US right now (send the first text /
+    // send the connection request). They always belong on this page.
+    // Awaiting-acceptance is waiting on THEM, so it does not.
+    const gateDue = mine
+      .filter(p => (p.stage === "waiting-first-text" || p.stage === "waiting-li-send") && !(window.isDNC && isDNC(p)))
+      .map(p => ({ p, t: 0 }));
+    const list = gateDue.concat(mine
       .filter(p => allowed[p.stage] && !(window.isDNC && isDNC(p)))
       // ONLY people whose next touch is due or overdue RIGHT NOW. Someone
       // whose next touch is scheduled for the future is on the clock — they
@@ -25250,7 +25359,7 @@ if(params.get("u") && params.get("pin")){
       .map(p => ({ p, task: (typeof window.touchReadyNow === "function") ? window.touchReadyNow(p) : null }))
       .filter(x => !!x.task)
       .map(x => ({ p: x.p, t: (x.task.unlockAt || 0) }))
-      .sort((a,b) => a.t - b.t); // most overdue first
+      .sort((a,b) => a.t - b.t)); // gates first, then most overdue
 
     wrap.appendChild(e("div",{class:"h-section"},
       e("div",{},
@@ -25320,12 +25429,18 @@ if(params.get("u") && params.get("pin")){
   let firstSnap = true;
   let pending = null;     // { cloud, cloudTime } waiting for the user to be idle
 
+  let _lastTypedAt = 0;
+  document.addEventListener("keydown", function(){ _lastTypedAt = Date.now(); }, true);
   function isBusy(){
-    // A modal is open, an input is focused, or a full-screen builder is up.
+    // A modal is open, or the user is ACTIVELY TYPING in a text field, or a
+    // full-screen builder is up. A merely-focused input or dropdown does NOT
+    // count — that used to park teammate updates indefinitely (nothing would
+    // ever sync in while the cursor sat in the search box).
     if(document.querySelector("#modal-bg.show, .modal-bg.show")) return true;
     if(document.body.classList.contains("wow-active") || document.body.classList.contains("proforma-active")) return true;
     const ae = document.activeElement;
-    if(ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)) return true;
+    const typing = ae && /^(INPUT|TEXTAREA)$/.test(ae.tagName) && (Date.now() - _lastTypedAt < 6000);
+    if(typing) return true;
     return false;
   }
 
@@ -25351,14 +25466,17 @@ if(params.get("u") && params.get("pin")){
     // PROSPECTS MERGE by id — a teammate's additions land even if this device
     // has "newer" unrelated edits, and this device's records are never dropped
     // by a whole-list replace. Deletions travel as tombstones.
+    if(Array.isArray(cloud.expiredActs) && cloud.expiredActs.length){
+      state.expiredActs = Array.from(new Set((state.expiredActs || []).concat(cloud.expiredActs))).slice(-1000);
+    }
     var merged = (typeof window.__rosMerge === "function")
-      ? window.__rosMerge(state.prospects || [], incoming, state.deletedIds || [], cloud.deletedIds || [])
+      ? window.__rosMerge(state.prospects || [], incoming, state.deletedIds || [], cloud.deletedIds || [], newer)
       : null;
     state.prospects = merged ? merged.list : incoming;
     if(merged) state.deletedIds = merged.deleted;
     // Activities merge as a union in BOTH directions so history survives.
     state.activities = (typeof window.__rosMergeActs === "function")
-      ? window.__rosMergeActs(state.activities || [], cloud.activities || [], merged ? merged.deleted : [])
+      ? window.__rosMergeActs(state.activities || [], cloud.activities || [], (merged ? merged.deleted : []).concat(state.expiredActs || []))
       : (newer ? (cloud.activities || []) : state.activities);
     if(newer){
       state.users            = cloud.users            || (typeof USERS !== "undefined" ? USERS.slice() : state.users);
@@ -25409,7 +25527,7 @@ if(params.get("u") && params.get("pin")){
   }
 
   function maybeApply(cloud, cloudTime){
-    if(isBusy()){ pending = { cloud: cloud, cloudTime: cloudTime }; return; }
+    if(isBusy()){ pending = { cloud: cloud, cloudTime: cloudTime, ts: Date.now() }; return; }
     const wasFirst = firstSnap;
     const changed = applyCloudState(cloud, cloudTime);
     // Only announce updates that actually changed something visible.
@@ -25419,11 +25537,13 @@ if(params.get("u") && params.get("pin")){
   }
   window.__applyCloud = maybeApply;
 
-  // Flush a deferred update once the user stops editing.
+  // Flush a deferred update once the user stops editing — and never let one
+  // sit parked for more than 20s regardless (a stuck "busy" state must not
+  // block teammate updates forever).
   setInterval(function(){
-    if(pending && !isBusy()){
+    if(pending && (!isBusy() || Date.now() - (pending.ts || 0) > 20000)){
       const p = pending; pending = null;
-      maybeApply(p.cloud, p.cloudTime);
+      applyCloudState(p.cloud, p.cloudTime);
     }
   }, 500);
 
@@ -25431,11 +25551,14 @@ if(params.get("u") && params.get("pin")){
     if(started) return;
     const fb = await window._fbReady;
     if(!fb || !fb.onSnapshot){ return; }            // offline / SDK blocked → stays on boot+manual sync
-    if(!fb.user){ try { await new Promise(res => window.addEventListener("firebase-auth-ready", res, { once:true })); } catch(e){} }
+    if(!fb.user){ try { await window.__awaitAuth(fb, 15000); } catch(e){ console.warn("[cloud] live sync: not signed in", e); window._syncDiag && (window._syncDiag.listener = "auth failed"); } }
     started = true;
     try {
       const ref = fb.doc(fb.fdb, ...FS_DOC_PATH);
       fb.onSnapshot(ref, function(snap){
+        window._syncDiag = window._syncDiag || {};
+        window._syncDiag.lastSnapAt = Date.now();
+        window._syncDiag.listener = "live";
         if(!snap || !snap.exists || !snap.exists()) { firstSnap = false; return; }
         const cloud = snap.data() || {};
         const cloudTime = cloud.lastModified || cloud._updatedAt || 0;
@@ -25449,8 +25572,20 @@ if(params.get("u") && params.get("pin")){
         }
         firstSnap = false;
       }, function(err){
-        console.warn("[cloud] live sync listener error", err);
+        // A listener error used to KILL live sync permanently and silently —
+        // the device would never receive another teammate update until a full
+        // reload. Now: show it, and auto-reattach with backoff.
+        console.warn("[cloud] live sync listener error — will reconnect", err);
+        window._syncDiag = window._syncDiag || {};
+        window._syncDiag.listener = "ERROR: " + (err && (err.code || err.message) || "unknown");
+        if(typeof setCloudStatus === "function") setCloudStatus("error", err);
+        started = false;
+        window._lsBackoff = Math.min(60000, (window._lsBackoff || 5000) * 2);
+        setTimeout(function(){ try { startLiveSync(); } catch(e){} }, window._lsBackoff);
       });
+      window._lsBackoff = 5000;
+      window._syncDiag = window._syncDiag || {};
+      window._syncDiag.listener = "live";
       console.log("[cloud] live sync active");
     } catch(err){
       console.warn("[cloud] could not start live sync", err);
@@ -25710,7 +25845,7 @@ if(params.get("u") && params.get("pin")){
   window.dueCounts = dueCounts;
 
   // Stages that belong in the active recruiting cadence list.
-  var ACTIVE_CADENCE_STAGES = ["new","engaged","deep","nurture"];
+  var ACTIVE_CADENCE_STAGES = ["new","engaging","engaged","deep","nurture"];
   // Stages where everyone gets a daily keep-warm touch, shown in their own section.
   var KEEPWARM_STAGES = ["loi"];
 
@@ -26163,6 +26298,19 @@ if(params.get("u") && params.get("pin")){
   function parseUnits(s){ if(!s) return null; var m = String(s).match(/(\d+)/); return m ? parseInt(m[1], 10) : null; }
   function isEmpty(v){ return v == null || v === "" || (typeof v === "number" && v === 0); }
 
+  // Canonical https://www.linkedin.com/in/<slug> — strips tracking params and
+  // mobile/locale prefixes so the stored URL always opens cleanly.
+  function normalizeLinkedIn(u){
+    if(!u) return "";
+    var s = String(u).trim().split("?")[0].split("#")[0].replace(/\/$/, "");
+    if(!s) return "";
+    var m = s.match(/linkedin\.com\/(?:[a-z]{2}\/)?(in|pub)\/([^\/]+)/i);
+    if(m) return "https://www.linkedin.com/in/" + m[2];
+    if(/^[A-Za-z0-9._-]+$/.test(s)) return "https://www.linkedin.com/in/" + s; // bare slug
+    return /^https?:\/\//i.test(s) ? s : "";
+  }
+  window.normalizeLinkedIn = normalizeLinkedIn;
+
   function applyResearchToProspect(p){
     var r = p.research; if(!r || r.error) return;
     var prof = r.profile || {};
@@ -26179,7 +26327,7 @@ if(params.get("u") && params.get("pin")){
     setIf("company",  firstFilled(prof.company, recent && recent.employer));
     setIf("market",   firstFilled(prof.market, recent && recent.location));
     setIf("nmls",     firstFilled(prof.nmls).replace(/\D/g, ""));
-    setIf("linkedin", firstFilled(prof.linkedin));
+    setIf("linkedin", normalizeLinkedIn(firstFilled(prof.linkedin) || (Array.isArray(r.linkedinCandidates) ? r.linkedinCandidates[0] : "")));
     setIf("instagram",firstFilled(prof.instagram));
     setIf("phone",    firstFilled(prof.phone));
     setIf("email",    firstFilled(prof.email));
@@ -26733,12 +26881,15 @@ if(params.get("u") && params.get("pin")){
   "use strict";
   var CANON = ["new","engaging","engaged","loi","closed","nurture"];
   var CANON_STAGES = [
-    { id:"new",      label:"New Prospect"      },
-    { id:"engaging", label:"Engaging"          },
-    { id:"engaged",  label:"Engaged"           },
-    { id:"loi",      label:"LOI Out"           },
-    { id:"closed",   label:"Closed/Joined"     },
-    { id:"nurture",  label:"Long Term Nurture" }
+    { id:"new",                label:"New Prospect"                 },
+    { id:"waiting-first-text", label:"Waiting for First Text"       },
+    { id:"waiting-li-send",    label:"Waiting for LinkedIn Connection" },
+    { id:"awaiting-li-accept", label:"Awaiting LinkedIn Acceptance" },
+    { id:"engaging",           label:"Engaging"                     },
+    { id:"engaged",            label:"Engaged"                      },
+    { id:"loi",                label:"LOI Out"                      },
+    { id:"closed",             label:"Closed/Joined"                },
+    { id:"nurture",            label:"Long Term Nurture"            }
   ];
 
   function phaseDone(p, step){
@@ -26831,6 +26982,22 @@ if(params.get("u") && params.get("pin")){
           var live = pid && (state.prospects || []).find(function(x){ return x && x.id === pid; });
           if(live && live !== p){
             GRAFT.forEach(function(k){ if(p[k] !== undefined && p[k] !== null) live[k] = p[k]; });
+          }
+          var tgt = live || p;
+          // Research was re-run on an expired record: it's wanted again, so
+          // clear the expiry flag and restart the 10-day clock.
+          if(tgt && tgt.dataExpired && tgt.research && !tgt.research.error){
+            delete tgt.dataExpired;
+            tgt.stageEnteredAt = Date.now();
+          }
+          var moved = false;
+          // FLOW 2.0: research done on a New prospect → move to Waiting for
+          // First Text (the personalized GoHighLevel text is the next action).
+          if(tgt && tgt.stage === "new" && !tgt.stagePinned && tgt.research && !tgt.research.error){
+            tgt.stage = "waiting-first-text"; moved = true;
+            if(typeof logActivity === "function") logActivity(tgt.id, "stage-change", "new \u2192 waiting-first-text");
+          }
+          if((live && live !== p) || moved){
             persist();
             if(typeof navigate === "function" && state.user) navigate(state.screen, { replace:true });
           }
@@ -26890,11 +27057,33 @@ if(params.get("u") && params.get("pin")){
     try{
       if(!state || !state.user) return false;   // wait until signed in
       var changed = false;
-      var hasLegacy = Array.isArray(state.stages) && state.stages.some(function(s){ return s && LEGACY_IDS.indexOf(s.id) !== -1; });
-      if(!Array.isArray(state.stages) || !state.stages.length || hasLegacy){
-        state.stages = CANON_STAGES.map(function(s){ return { id:s.id, label:s.label }; });
+      var canonIds = CANON_STAGES.map(function(s){ return s.id; });
+      var have = Array.isArray(state.stages) ? state.stages.slice() : [];
+      var haveIds = have.map(function(s){ return s && s.id; });
+      var hasLegacy = have.some(function(s){ return s && LEGACY_IDS.indexOf(s.id) !== -1; });
+      var missingCanon = canonIds.some(function(id){ return haveIds.indexOf(id) === -1; });
+      if(!have.length || hasLegacy || missingCanon){
+        // Rebuild to the canonical flow; CUSTOM columns (e.g. Webinar Leads)
+        // are preserved and slot in right after New Prospect.
+        var customs = have.filter(function(x){ return x && canonIds.indexOf(x.id) === -1 && LEGACY_IDS.indexOf(x.id) === -1; });
+        var rebuilt = CANON_STAGES.map(function(x){ return { id:x.id, label:x.label }; });
+        if(customs.length) rebuilt = [rebuilt[0]].concat(customs).concat(rebuilt.slice(1));
+        state.stages = rebuilt;
         changed = true;
       }
+      // Cadences no longer start with a LinkedIn connection request — that
+      // now happens BEFORE the cadence, in the Waiting-for-LinkedIn stages.
+      try{
+        var tset = state.cadenceTemplates;
+        if(tset){ ["bm","lo"].forEach(function(tid){
+          var t = Array.isArray(tset) ? tset.find(function(x){ return x && x.id === tid; }) : tset[tid];
+          if(t && Array.isArray(t.steps)){
+            var before = t.steps.length;
+            t.steps = t.steps.filter(function(st){ return !/connection request/i.test((st && (st.action || st.short)) || ""); });
+            if(t.steps.length !== before) changed = true;
+          }
+        }); }
+      }catch(e){}
       var ids = currentStageIds();
       var fallback = ids.indexOf("engaging") !== -1 ? "engaging" : ids[0];
       // Translate a stage reference from history (an id OR a display label,
@@ -26929,6 +27118,9 @@ if(params.get("u") && params.get("pin")){
           if(idx === 0 && from && !p.originStage){ p.originStage = from; changed = true; }
         });
         if(!p.originStage){ p.originStage = (p.stagesSeen[0] || p.stage); changed = true; }
+        // FLOW 2.0 backfill: already-researched New prospects move to
+        // Waiting for First Text.
+        if(p.stage === "new" && !p.stagePinned && p.research && !p.research.error){ p.stage = "waiting-first-text"; changed = true; }
       });
       if(changed){
         persist();
@@ -27163,7 +27355,7 @@ if(params.get("u") && params.get("pin")){
 
   function applyImport(picked){
     var created = 0, updated = 0;
-    var VALID = ["new","engaging","engaged","loi","closed","nurture"];
+    var VALID = ["new","waiting-first-text","waiting-li-send","awaiting-li-accept","engaging","engaged","loi","closed","nurture"];
     picked.forEach(function(r){
       var rec = r.rec;
       var tier = (["Green","Yellow","Red"].indexOf(rec.tier) !== -1) ? rec.tier : null;
@@ -27540,7 +27732,12 @@ if(params.get("u") && params.get("pin")){
         if(!p || !p.id) return;
         // House rule: a New Prospect with an assigned/started cadence belongs
         // in Engaging — whichever path started the cadence.
-        if(p.stage === "new" && p.cadence && p.cadence.startedAt) p.stage = "engaging";
+        if(p.stage === "new" && !p.stagePinned && p.cadence && p.cadence.startedAt) p.stage = "engaging";
+        // House rule: Engaged means Peter's Playbook — switch SAFELY (history
+        // is never filtered/wiped), whichever path moved them there.
+        if(p.stage === "engaged" && p.cadence && p.cadence.templateId !== "active-recruit" && typeof window.safeSwitchToPlaybook === "function"){
+          window.safeSwitchToPlaybook(p);
+        }
         if(!Array.isArray(p.stagesSeen)) p.stagesSeen = p.stage ? [p.stage] : [];
         var prev = _lastStage[p.id];
         if(p.stage && p.stagesSeen.indexOf(p.stage) === -1) p.stagesSeen.push(p.stage);
@@ -27571,6 +27768,7 @@ if(params.get("u") && params.get("pin")){
     window.stateToPersist = function(){
       var out = _stp.apply(this, arguments);
       out.deletedIds = (state.deletedIds || []).slice(-500); // cap growth
+      out.expiredActs = (state.expiredActs || []).slice(-1000); // prospects whose activity history has expired
       return out;
     };
   }
@@ -27609,7 +27807,7 @@ if(params.get("u") && params.get("pin")){
     return out;
   };
 
-  window.__rosMerge = function(localArr, cloudArr, localDel, cloudDel){
+  window.__rosMerge = function(localArr, cloudArr, localDel, cloudDel, cloudIsNewer){
     localArr = localArr || []; cloudArr = cloudArr || [];
     var del = {};
     (cloudDel || []).forEach(function(id){ if(id) del[id] = true; });
@@ -27626,13 +27824,26 @@ if(params.get("u") && params.get("pin")){
     // GRAFTED from the loser so it can never be silently discarded.
     function graft(w, l){
       if(!w || !l) return w;
-      if(!w.research && l.research) w.research = l.research;
+      // DATA EXPIRY wins: if either copy has expired, the merged record stays
+      // expired — the research dossier is never resurrected from a fatter copy.
+      if(l.dataExpired && !w.dataExpired){
+        w.dataExpired = l.dataExpired;
+        delete w.research;
+      }
+      if(!w.dataExpired && !w.research && l.research) w.research = l.research;
       ["originStage","loiOutDate","hireDate","linkedin","instagram","nmls"].forEach(function(k){
         if((w[k] == null || w[k] === "") && l[k] != null && l[k] !== "") w[k] = l[k];
       });
       if(Array.isArray(l.stagesSeen)){
         if(!Array.isArray(w.stagesSeen)) w.stagesSeen = [];
         l.stagesSeen.forEach(function(s){ if(w.stagesSeen.indexOf(s) === -1) w.stagesSeen.push(s); });
+      }
+      // Attachments union by url — files uploaded on two devices both survive.
+      if(Array.isArray(l.files) && l.files.length){
+        if(!Array.isArray(w.files)) w.files = [];
+        l.files.forEach(function(f){
+          if(f && f.url && !w.files.some(function(x){ return x && x.url === f.url; })) w.files.push(f);
+        });
       }
       return w;
     }
@@ -27641,8 +27852,18 @@ if(params.get("u") && params.get("pin")){
       if(!p || !p.id || del[p.id]) return;
       var c = byId[p.id];
       if(!c){ byId[p.id] = p; order.push(p.id); contributed = true; }
-      else if((p._rev || 0) > (c._rev || 0)){ byId[p.id] = graft(p, c); contributed = true; }
-      else { byId[p.id] = graft(c, p); }
+      else {
+        var localWins;
+        if(p._rev && c._rev){ localWins = p._rev > c._rev; }
+        else {
+          // One side has no revision stamp (older build) — fall back to the
+          // document-level clock so an unstamped teammate edit isn't
+          // systematically discarded by any stamped local copy.
+          localWins = !cloudIsNewer;
+        }
+        if(localWins){ byId[p.id] = graft(p, c); contributed = true; }
+        else { byId[p.id] = graft(c, p); }
+      }
     });
     return {
       list: order.map(function(id){ return byId[id]; }),
@@ -28026,7 +28247,7 @@ if(params.get("u") && params.get("pin")){
 <script>
 (function(){
   "use strict";
-  window.__ROS_BUILD = "Build 2026-07-22D \u2014 quiet sync + size auto-trim";
+  window.__ROS_BUILD = "Build 2026-07-29R \u2014 10-day research expiry (Closed/Nurture)";
   try { console.log("[RecruitOS] " + window.__ROS_BUILD); } catch(e){}
   if(typeof window.viewSettings === "function"){
     var _vs = window.viewSettings;
@@ -28038,6 +28259,1046 @@ if(params.get("u") && params.get("pin")){
       return wrap;
     };
   }
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — SYNC HEALTH PANEL
+     Settings card that shows the truth about syncing on THIS
+     device: signed-in state, live listener status, when the last
+     update arrived, and whether the last save reached the cloud
+     (with the actual error if it didn't). Plus a Test sync button.
+     No more guessing whether sync is working.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+  function ago(ts){
+    if(!ts) return "never";
+    var s = Math.round((Date.now() - ts) / 1000);
+    if(s < 60) return s + "s ago";
+    if(s < 3600) return Math.round(s/60) + "m ago";
+    return Math.round(s/3600) + "h ago";
+  }
+  function statusRow(label, value, good){
+    return e("div",{style:"display:flex;justify-content:space-between;gap:12px;padding:5px 0;border-bottom:1px solid var(--line);font-size:12.5px"},
+      e("span",{class:"muted"}, label),
+      e("span",{style:"font-weight:600;color:" + (good ? "var(--good, #2e7d32)" : "var(--bad, #c62828)") + ";text-align:right"}, value)
+    );
+  }
+  if(typeof window.viewSettings === "function"){
+    var _vs = window.viewSettings;
+    window.viewSettings = function(){
+      var wrap = _vs.apply(this, arguments);
+      try{
+        var d = window._syncDiag || {};
+        var card = e("div",{class:"card",style:"margin-top:12px"});
+        card.appendChild(e("h3",{style:"margin:0 0 8px;font-size:14px"}, "Sync health (this device)"));
+        var authOk = String(d.auth||"").indexOf("ok") === 0;
+        var lisOk = d.listener === "live";
+        var pushOk = !d.lastPushErr;
+        card.appendChild(statusRow("Signed in to cloud", d.auth || "waiting\u2026", authOk));
+        card.appendChild(statusRow("Live updates listener", (d.listener || "starting\u2026") + (d.lastSnapAt ? " \u00B7 last update " + ago(d.lastSnapAt) : ""), lisOk));
+        card.appendChild(statusRow("Last save to cloud", d.lastPushErr ? d.lastPushErr : (d.lastPushAt ? "ok \u00B7 " + ago(d.lastPushAt) : "none yet"), pushOk));
+        try{
+          var kb = Math.round(new Blob([JSON.stringify(stateToPersist())]).size / 1024);
+          card.appendChild(statusRow("Data size (cloud limit 1024 KB)", kb + " KB" + (kb > 880 ? " \u2014 auto-trim will engage" : ""), kb <= 880));
+        }catch(szErr){}
+        var btnRow = e("div",{style:"display:flex;gap:8px;margin-top:10px;align-items:center"});
+        var result = e("span",{class:"muted",style:"font-size:12px"});
+        btnRow.appendChild(e("button",{class:"btn sm",onClick:function(){
+          result.textContent = "Testing\u2026";
+          try{
+            state.lastModified = Date.now();
+            Promise.resolve(db.pushToCloud(stateToPersist())).then(function(){
+              result.textContent = "\u2713 Save reached the cloud. Check the other device's panel for 'last update' just now.";
+            }).catch(function(err){
+              result.textContent = "\u2717 Failed: " + ((err && (err.code || err.message)) || err);
+            });
+          }catch(err){ result.textContent = "\u2717 Failed: " + ((err && err.message) || err); }
+        }}, "Test sync now"));
+        btnRow.appendChild(result);
+        card.appendChild(btnRow);
+        card.appendChild(e("p",{class:"muted",style:"font-size:11.5px;margin:10px 0 0;line-height:1.5"},
+          "If 'Signed in' shows FAILED on any device: in Firebase Console \u2192 Authentication, make sure Anonymous sign-in is enabled and the site's domain is listed under Settings \u2192 Authorized domains."));
+        wrap.appendChild(card);
+      }catch(err){ console.error("sync health card", err); }
+      return wrap;
+    };
+  }
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — FLOW 2.0
+     The gated pipeline: stage gates with one-tap advance, safe
+     auto-switch to Peter's Playbook on Engaged (never wipes
+     history), a clean funnel pipeline view (replaces the crowded
+     9-column board; board still available via toggle), full-screen
+     stage pages, and the research-driven first-text composer.
+     ============================================================ -->
+<style>
+  /* funnel view */
+  .fn-band{border:1px solid var(--line);border-radius:14px;background:var(--surface);margin-bottom:10px;overflow:hidden;box-shadow:var(--shadow)}
+  .fn-head{display:flex;align-items:center;gap:10px;padding:11px 14px;border-left:5px solid var(--stage,var(--brand));cursor:pointer}
+  .fn-name{font-weight:700;font-size:14px}
+  .fn-count{font-size:12px;color:var(--t-3);font-variant-numeric:tabular-nums}
+  .fn-vol{margin-left:auto;font-size:12px;color:var(--t-2);font-variant-numeric:tabular-nums}
+  .fn-open{border:1px solid var(--line);background:none;border-radius:8px;padding:4px 10px;font-size:12px;color:var(--t-2);cursor:pointer}
+  .fn-open:hover{color:var(--brand);border-color:var(--brand)}
+  .fn-strip{display:flex;gap:8px;overflow-x:auto;padding:0 14px 12px;scrollbar-width:thin}
+  .fn-chip{flex:0 0 auto;display:flex;align-items:center;gap:7px;border:1px solid var(--line);border-radius:999px;padding:5px 12px 5px 6px;background:var(--surface-2);cursor:pointer;font-size:12.5px;transition:border-color .15s, transform .12s}
+  .fn-chip:hover{border-color:var(--brand);transform:translateY(-1px)}
+  .fn-chip .av{width:22px;height:22px;border-radius:50%;background:var(--brand-tint,rgba(0,129,139,.12));color:var(--brand);display:flex;align-items:center;justify-content:center;font-size:9.5px;font-weight:700}
+  .fn-more{flex:0 0 auto;align-self:center;font-size:12px;color:var(--t-3)}
+  .fn-empty{padding:0 14px 12px;font-size:12px;color:var(--t-3);font-style:italic}
+  /* stage full-screen */
+  .sf-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px;margin-top:14px}
+  .sf-grid .k-card{max-width:none}
+  /* gate card */
+  .gate-card{border:1px solid var(--line);border-left:5px solid var(--stage,var(--brand));border-radius:14px;padding:18px;background:var(--surface);margin-bottom:14px}
+  .gate-q{font-size:16px;font-weight:700;margin-bottom:4px}
+  .gate-sub{font-size:12.5px;color:var(--t-3);margin-bottom:14px;line-height:1.5}
+  .gate-actions{display:flex;gap:8px;flex-wrap:wrap}
+  @media(max-width:760px){ .sf-grid{grid-template-columns:1fr 1fr} }
+</style>
+<script>
+(function(){
+  "use strict";
+
+  /* ---------- stage gates ---------- */
+  var GATES = {
+    "waiting-first-text": {
+      q: "Has the first text gone out?",
+      sub: "Send the personalized intro text in GoHighLevel (Compose builds it from the research), then mark it here.",
+      btn: "\u2713 Yes \u2014 first text sent",
+      next: "waiting-li-send",
+      log: "First text sent \u2192 waiting on LinkedIn connection send",
+      compose: true
+    },
+    "waiting-li-send": {
+      q: "Have you sent a connection request?",
+      sub: "Peter sends the LinkedIn connection request, then marks it here.",
+      btn: "\u2713 Done \u2014 connection request sent",
+      next: "awaiting-li-accept",
+      log: "LinkedIn connection request sent \u2192 awaiting acceptance"
+    },
+    "awaiting-li-accept": {
+      q: "Have they accepted your connection?",
+      sub: "They sit here until they connect back or engage. The moment they do, mark it and they move into Engaging \u2014 that's when cadences start.",
+      btn: "\u2713 Yes \u2014 they accepted / engaged back",
+      next: "engaging",
+      log: "LinkedIn connection accepted \u2192 Engaging"
+    }
+  };
+  window.STAGE_GATES = GATES;
+
+  try{
+    STAGE_COLORS["waiting-first-text"] = "#6366f1";
+    STAGE_COLORS["waiting-li-send"]    = "#0ea5e9";
+    STAGE_COLORS["awaiting-li-accept"] = "#8b5cf6";
+  }catch(e){}
+
+  window.advanceGate = function(p){
+    var g = GATES[p.stage];
+    if(!g) return;
+    var from = p.stage;
+    p.stage = g.next;
+    p.stageEnteredAt = Date.now();
+    if(typeof logActivity === "function") logActivity(p.id, "stage-change", from + " \u2192 " + g.next);
+    if(typeof logActivity === "function") logActivity(p.id, "note", g.log);
+    persist();
+    if(typeof showToast === "function") showToast("Moved to " + (getStages().find(function(s){ return s.id === g.next; }) || {label:g.next}).label);
+    if(typeof navigate === "function") navigate(state.screen, { replace:true });
+  };
+
+  /* ---------- SAFE Peter's Playbook switch (never wipes history) ---------- */
+  window.safeSwitchToPlaybook = function(p){
+    try{
+      if(typeof ensureCadence === "function") ensureCadence(p);
+      if(!p.cadence) p.cadence = {};
+      if(p.cadence.templateId === "active-recruit") return;
+      p.cadence.templateId = "active-recruit";
+      if(!p.cadence.startedAt) p.cadence.startedAt = Date.now();
+      p.cadence.paused = false;
+      // NOTE: completed/skipped history is deliberately NOT touched — the old
+      // auto-switch filtered it and destroyed LinkedIn cadence progress.
+      if(typeof logActivity === "function") logActivity(p.id, "cadence-switched", "Engaged \u2192 Peter's Playbook (history preserved)");
+    }catch(e){ console.error("safe playbook switch", e); }
+  };
+
+  /* ---------- gate reasons on Work Now ---------- */
+  if(typeof window.priorityReason === "function"){
+    var _pr = window.priorityReason;
+    window.priorityReason = function(p){
+      var g = p && GATES[p.stage];
+      if(g) return g.q;
+      return _pr.apply(this, arguments);
+    };
+  }
+
+  /* ---------- gate card on the Playbook tab ---------- */
+  if(typeof window.pdPlaybook === "function"){
+    var _pb = window.pdPlaybook;
+    window.pdPlaybook = function(p){
+      var g = GATES[p.stage];
+      if(!g) return _pb.apply(this, arguments);
+      var wrap = e("div",{class:"screen"});
+      var card = e("div",{class:"gate-card",style:"--stage:" + (STAGE_COLORS[p.stage] || "var(--brand)")});
+      card.appendChild(e("div",{class:"gate-q"}, g.q));
+      card.appendChild(e("div",{class:"gate-sub"}, g.sub));
+      // LinkedIn is essential to the connection stages — surface it right here
+      // so Peter can act without digging, or fix it if research came up empty.
+      if(p.stage === "waiting-li-send" || p.stage === "awaiting-li-accept"){
+        var li = p.linkedin ? (window.normalizeLinkedIn ? normalizeLinkedIn(p.linkedin) : p.linkedin) : "";
+        if(li){
+          card.appendChild(e("div",{style:"margin:-6px 0 14px"},
+            e("a",{href:li,target:"_blank",rel:"noopener",style:"font-size:13px;font-weight:600;color:var(--brand);text-decoration:none"}, "\u2197 Open LinkedIn profile"),
+            e("div",{class:"muted",style:"font-size:11.5px;margin-top:2px;word-break:break-all"}, li)
+          ));
+        } else {
+          var warn = e("div",{style:"margin:-6px 0 14px;padding:10px 12px;border-radius:10px;background:rgba(255,172,39,.12);border:1px solid rgba(255,172,39,.5)"});
+          warn.appendChild(e("div",{style:"font-size:12.5px;font-weight:700;margin-bottom:6px"}, "\u26A0 No LinkedIn on file"));
+          warn.appendChild(e("div",{class:"muted",style:"font-size:12px;line-height:1.5;margin-bottom:8px"},
+            "This stage needs their profile. Re-run research to hunt for it, or paste the URL in."));
+          var wrow = e("div",{style:"display:flex;gap:8px;flex-wrap:wrap"});
+          wrow.appendChild(e("button",{class:"btn sm",onClick:function(){ if(typeof runResearch === "function") runResearch(p); }}, "\u21BB Re-run research"));
+          wrow.appendChild(e("button",{class:"btn sm",onClick:function(){
+            uiPrompt("LinkedIn profile URL", { placeholder:"https://www.linkedin.com/in/\u2026" }, function(v){
+              if(!v) return;
+              var norm = window.normalizeLinkedIn ? normalizeLinkedIn(v) : v;
+              if(!norm) return showToast("That doesn't look like a LinkedIn URL");
+              p.linkedin = norm; persist(); showToast("LinkedIn saved");
+              navigate(state.screen, { replace:true });
+            });
+          }}, "\u270E Paste URL"));
+          warn.appendChild(wrow);
+          card.appendChild(warn);
+        }
+      }
+      var row = e("div",{class:"gate-actions"});
+      if(g.compose){
+        row.appendChild(e("button",{class:"btn",onClick:function(){
+          window._pdTabs = window._pdTabs || {}; window._pdTabs[p.id] = "Text generation";
+          navigate(state.screen, { replace:true });
+        }}, "\u270D Compose first text"));
+      }
+      row.appendChild(e("button",{class:"btn",style:"background:var(--brand);color:#fff",onClick:function(){ advanceGate(p); }}, g.btn));
+      card.appendChild(row);
+      wrap.appendChild(card);
+      wrap.appendChild(e("p",{class:"muted",style:"font-size:12px;line-height:1.55"},
+        "Cadences start once they reach Engaging. The playbook checklist takes over automatically at Engaged."));
+      return wrap;
+    };
+  }
+
+  /* ---------- first-text composer (research-driven, ultra customizable) ---------- */
+  var PREFS_KEY = "pm_composer_prefs";
+  function loadPrefs(){ try{ return JSON.parse(localStorage.getItem(PREFS_KEY)) || {}; }catch(e){ return {}; } }
+  function savePrefs(o){ try{ localStorage.setItem(PREFS_KEY, JSON.stringify(o)); }catch(e){} }
+
+  window.openTextComposer = function(p){
+    var prefs = loadPrefs();
+    showModal("First text \u2014 " + (p.firstName || "") + " " + (p.lastName || ""), function(modal, close){
+      function sel(opts, val){
+        var s = e("select",{});
+        opts.forEach(function(o){ var op = e("option",{value:o}, o); if(o === val) op.selected = true; s.appendChild(op); });
+        return s;
+      }
+      var lenS  = sel(["Short (1-2 sentences)","Medium (3-4 sentences)","Long (a full intro paragraph)"], prefs.len || "Short (1-2 sentences)");
+      var toneS = sel(["Warm & casual","Professional","Direct","Playful"], prefs.tone || "Warm & casual");
+      var angS  = sel(["Simple intro","Lead with something specific about them","Market/industry chat","Webinar / What's Working Now invite"], prefs.angle || "Lead with something specific about them");
+      var grid = e("div",{class:"form-grid"});
+      grid.appendChild(e("div",{}, e("label",{},"Length"), lenS));
+      grid.appendChild(e("div",{}, e("label",{},"Tone"), toneS));
+      grid.appendChild(e("div",{}, e("label",{},"Angle"), angS));
+      modal.appendChild(grid);
+      var custom = e("textarea",{rows:2, placeholder:"Anything specific? (e.g. mention the Sacramento market, keep it under 240 chars, reference their 20 years at Guild\u2026)"});
+      custom.value = prefs.custom || "";
+      modal.appendChild(e("div",{style:"margin-top:8px"}, e("label",{style:"font-size:12px;color:var(--t-2)"},"Custom instructions"), custom));
+      var out = e("textarea",{rows:6, placeholder:"Your text will appear here \u2014 edit it freely before copying.", style:"margin-top:10px;width:100%"});
+      modal.appendChild(out);
+      var status = e("div",{class:"muted",style:"font-size:12px;margin-top:4px"});
+      modal.appendChild(status);
+
+      function researchFacts(){
+        var r = p.research || {};
+        var bits = [];
+        ["summary","company","position","market","production","highlights","angle","notes"].forEach(function(k){
+          if(r[k]) bits.push(k + ": " + (typeof r[k] === "string" ? r[k] : JSON.stringify(r[k])));
+        });
+        if(p.company) bits.push("company: " + p.company);
+        if(p.estProduction) bits.push("est production: $" + p.estProduction + "M/yr");
+        if(p.market) bits.push("market: " + p.market);
+        return bits.join("\n");
+      }
+      function generate(){
+        savePrefs({ len:lenS.value, tone:toneS.value, angle:angS.value, custom:custom.value });
+        status.textContent = "Writing\u2026";
+        var sys = "You write the FIRST outbound SMS from Aidan Boyd at Partners Mortgage to a loan officer / branch manager recruit. "
+          + "It goes out via text, so it must read like a real person texting \u2014 no corporate voice, no em dashes, no salesy pitch, no links. "
+          + "Introduce Aidan naturally. Use the research to make it feel hand-written for THIS person (one specific detail max \u2014 don't be creepy). "
+          + "Never mention 'recruiting' outright; the goal is simply a reply. Return ONLY the message text, nothing else.";
+        var prompt = "Prospect: " + (p.firstName||"") + " " + (p.lastName||"") + "\n"
+          + "Research:\n" + (researchFacts() || "(none — keep it generic but warm)") + "\n\n"
+          + "Length: " + lenS.value + "\nTone: " + toneS.value + "\nAngle: " + angS.value
+          + (custom.value.trim() ? "\nExtra instructions: " + custom.value.trim() : "");
+        callAnthropic(prompt, { system: sys, maxTokens: 600, label: "First text: " + (p.firstName||"") })
+          .then(function(txt){ out.value = String(txt || "").trim(); status.textContent = "Edit freely, then copy into GoHighLevel."; })
+          .catch(function(err){ status.textContent = "Couldn't write it \u2014 " + ((err && err.message) || "check connection") + "."; });
+      }
+      var row = e("div",{class:"modal-actions",style:"margin-top:10px"});
+      row.appendChild(e("button",{class:"btn ghost",onClick:close},"Close"));
+      row.appendChild(e("button",{class:"btn",onClick:generate},"\u21BB Generate"));
+      row.appendChild(e("button",{class:"btn",onClick:function(){
+        if(!out.value.trim()) return showToast("Nothing to copy yet");
+        navigator.clipboard && navigator.clipboard.writeText(out.value).then(function(){ showToast("Copied \u2014 paste into GoHighLevel"); });
+        if(typeof logActivity === "function") logActivity(p.id, "outreach-sent", "First text drafted/copied");
+      }},"Copy"));
+      row.appendChild(e("button",{class:"btn",style:"background:var(--brand);color:#fff",onClick:function(){ close(); advanceGate(p); }},"\u2713 Mark first text sent"));
+      modal.appendChild(row);
+      generate();
+    });
+  };
+
+  /* ---------- funnel pipeline view (default) + board toggle ---------- */
+  var VIEW_KEY = "pm_pipe_view";
+  if(typeof window.viewProspects === "function"){
+    var _board = window.viewProspects;
+    window.viewProspects = function(){
+      var mode = (function(){ try{ return localStorage.getItem(VIEW_KEY) || "funnel"; }catch(e){ return "funnel"; } })();
+      if(mode === "board") return boardWithToggle();
+      return funnelView();
+    };
+    function toggleBtn(cur){
+      return e("div",{style:"display:flex;gap:6px"},
+        e("button",{class:"btn sm" + (cur==="funnel"?"":" subtle"),onClick:function(){ try{localStorage.setItem(VIEW_KEY,"funnel");}catch(e){} navigate(state.screen,{replace:true}); }},"Funnel"),
+        e("button",{class:"btn sm" + (cur==="board"?"":" subtle"),onClick:function(){ try{localStorage.setItem(VIEW_KEY,"board");}catch(e){} navigate(state.screen,{replace:true}); }},"Board")
+      );
+    }
+    function boardWithToggle(){
+      var v = _board.apply(this, arguments);
+      try{ v.insertBefore(e("div",{style:"display:flex;justify-content:flex-end;margin-bottom:8px"}, toggleBtn("board")), v.firstChild); }catch(e){}
+      return v;
+    }
+    function funnelView(){
+      var wrap = e("div",{class:"screen"});
+      wrap.appendChild(e("div",{class:"h-section"},
+        e("div",{}, e("h2",{},"Pipeline"), e("div",{class:"sub"},"Tap a stage to open it full screen")),
+        e("div",{class:"actions"}, toggleBtn("funnel"))
+      ));
+      var byStage = {};
+      (state.prospects || []).forEach(function(p){ if(!p) return; (byStage[p.stage] = byStage[p.stage] || []).push(p); });
+      getStages().forEach(function(stg){
+        if(window.isHoldingStage && window.isHoldingStage(stg.id)) return;  // held outside the pipeline
+        var ppl = (byStage[stg.id] || []).slice().sort(function(a,b){ return (b.monthlyVolume||0) - (a.monthlyVolume||0); });
+        var vol = ppl.reduce(function(s,p){ return s + (Number(p.monthlyVolume)||0); }, 0);
+        var band = e("div",{class:"fn-band",style:"--stage:" + (typeof stageColor === "function" ? stageColor(stg.id) : "var(--brand)")});
+        var head = e("div",{class:"fn-head",onClick:function(){ navigate("stage:" + stg.id); }},
+          e("span",{class:"fn-name"}, stg.label),
+          e("span",{class:"fn-count"}, String(ppl.length)),
+          vol ? e("span",{class:"fn-vol"}, "$" + Math.round(vol/1e6*10)/10 + "M/mo") : e("span",{class:"fn-vol"},""),
+          e("button",{class:"fn-open",onClick:function(ev){ ev.stopPropagation(); navigate("stage:" + stg.id); }},"Open \u2197")
+        );
+        band.appendChild(head);
+        if(ppl.length){
+          var strip = e("div",{class:"fn-strip"});
+          ppl.slice(0, 30).forEach(function(p){
+            var ini = ((p.firstName||"?").charAt(0) + (p.lastName||"").charAt(0)).toUpperCase();
+            strip.appendChild(e("div",{class:"fn-chip",onClick:function(){ navigate("prospect:" + p.id); }},
+              e("span",{class:"av"}, ini),
+              e("span",{}, (p.firstName||"") + " " + (p.lastName||""))
+            ));
+          });
+          if(ppl.length > 30) strip.appendChild(e("span",{class:"fn-more"}, "+" + (ppl.length - 30) + " more \u2192"));
+          band.appendChild(strip);
+        } else {
+          band.appendChild(e("div",{class:"fn-empty"},"Empty"));
+        }
+        wrap.appendChild(band);
+      });
+      return wrap;
+    }
+  }
+
+  /* ---------- full-screen stage view ---------- */
+  window.viewStageFull = function(sid){
+    var stg = getStages().find(function(s){ return s.id === sid; }) || { id:sid, label:sid };
+    var ppl = (state.prospects || []).filter(function(p){ return p && p.stage === sid; })
+      .sort(function(a,b){ return (b.monthlyVolume||0) - (a.monthlyVolume||0); });
+    var wrap = e("div",{class:"screen"});
+    var search = e("input",{placeholder:"Filter by name or company\u2026", style:"max-width:260px"});
+    wrap.appendChild(e("div",{class:"h-section"},
+      e("div",{},
+        e("h2",{}, stg.label),
+        e("div",{class:"sub"}, ppl.length + " prospect" + (ppl.length===1?"":"s"))
+      ),
+      e("div",{class:"actions",style:"display:flex;gap:8px;align-items:center"},
+        search,
+        e("button",{class:"btn sm",onClick:function(){ if(window.exportStageReport) exportStageReport(stg.id, stg.label); }},"\u2913 Export"),
+        e("button",{class:"btn sm subtle",onClick:function(){ navigate("prospects"); }},"\u2190 Pipeline")
+      )
+    ));
+    var grid = e("div",{class:"sf-grid"});
+    function draw(){
+      grid.innerHTML = "";
+      var q = (search.value || "").toLowerCase().trim();
+      ppl.filter(function(p){
+        if(!q) return true;
+        return ((p.firstName||"")+" "+(p.lastName||"")+" "+(p.company||"")).toLowerCase().indexOf(q) !== -1;
+      }).forEach(function(p){
+        grid.appendChild(typeof kanbanCard === "function" ? kanbanCard(p) : e("div",{class:"card"},(p.firstName||"")+" "+(p.lastName||"")));
+      });
+      if(!grid.childNodes.length) grid.appendChild(e("div",{class:"muted"},"No one matches."));
+    }
+    search.addEventListener("input", draw);
+    draw();
+    wrap.appendChild(grid);
+    return wrap;
+  };
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — TEXT GENERATION TAB
+     A dedicated composer on every prospect. Pulls the research
+     dossier in, lets you pick EXACTLY what gets referenced, and
+     controls purpose, length (down to a word count), tone, opener,
+     CTA, emoji, and hard include/avoid rules. Produces 1-3
+     variants with live SMS character/segment metering, each
+     editable, copyable, and re-rollable on its own.
+     ============================================================ -->
+<style>
+  .tg-card{border:1px solid var(--line);border-radius:14px;background:var(--surface);padding:16px;margin-bottom:12px;box-shadow:var(--shadow)}
+  .tg-h{font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--brand);font-weight:700;margin:0 0 10px}
+  .tg-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px}
+  .tg-grid label{display:block;font-size:11.5px;color:var(--t-3);margin-bottom:3px}
+  .tg-grid select,.tg-grid input{width:100%}
+  .tg-hooks{display:flex;flex-direction:column;gap:7px;max-height:230px;overflow:auto;padding-right:4px}
+  .tg-hook{display:flex;gap:8px;align-items:flex-start;font-size:12.5px;line-height:1.45;padding:7px 9px;border:1px solid var(--line);border-radius:9px;cursor:pointer;transition:border-color .15s,background .15s}
+  .tg-hook:hover{border-color:var(--brand)}
+  .tg-hook.on{border-color:var(--brand);background:var(--brand-tint,rgba(0,129,139,.07))}
+  .tg-hook input{margin-top:2px;flex:0 0 auto}
+  .tg-hook .src{display:block;color:var(--t-3);font-size:11px;margin-top:2px}
+  .tg-var{border:1px solid var(--line);border-left:4px solid var(--brand);border-radius:12px;padding:12px;margin-bottom:10px;background:var(--surface)}
+  .tg-var textarea{width:100%;border:none;background:none;resize:vertical;font:inherit;font-size:13.5px;line-height:1.55;color:var(--t-1);outline:none;min-height:76px}
+  .tg-meter{display:flex;gap:12px;align-items:center;font-size:11.5px;color:var(--t-3);margin-top:8px;flex-wrap:wrap}
+  .tg-meter .over{color:var(--bad,#c62828);font-weight:700}
+  .tg-acts{display:flex;gap:6px;margin-left:auto;flex-wrap:wrap}
+  .tg-empty{font-size:12.5px;color:var(--t-3);font-style:italic}
+</style>
+<script>
+(function(){
+  "use strict";
+  var PK = "pm_textgen_prefs";
+  function prefs(){ try{ return JSON.parse(localStorage.getItem(PK)) || {}; }catch(e){ return {}; } }
+  function savePrefs(o){ try{ localStorage.setItem(PK, JSON.stringify(o)); }catch(e){} }
+
+  // GSM-7 vs UCS-2 (emoji forces 70-char segments) — real SMS metering.
+  function smsInfo(t){
+    var len = (t || "").length;
+    var uni = /[^\u0000-\u007F\u00A0-\u00FF]/.test(t || "");
+    var per = uni ? 67 : 153, first = uni ? 70 : 160;
+    // Single message gets the full 160 (70 unicode). Once it splits, EVERY
+    // segment carries a header, so the whole message is metered at 153 (67).
+    var seg = len === 0 ? 0 : (len <= first ? 1 : Math.ceil(len / per));
+    return { len: len, seg: seg, uni: uni };
+  }
+
+  function hooksFor(p){
+    var r = p.research || {}, out = [];
+    (r.rapportHooks || []).forEach(function(h){
+      if(h && h.hook) out.push({ id:"rh:"+out.length, text:h.hook, src:h.source || "rapport hook" });
+    });
+    (r.vulnerabilities || []).forEach(function(v){
+      if(v && v.factor) out.push({ id:"vu:"+out.length, text:v.factor, src:"why they might move" + (v.strength ? " \u00B7 " + v.strength : "") });
+    });
+    var recent = (r.timeline || [])[0];
+    if(recent && recent.employer) out.push({ id:"tl", text:recent.title ? (recent.title + " at " + recent.employer) : ("at " + recent.employer), src:"current role" });
+    var pe = r.productionEstimate || {};
+    if(pe.volume) out.push({ id:"pv", text:"production around " + pe.volume, src:"production estimate" });
+    if(p.market) out.push({ id:"mk", text:"based in " + p.market, src:"market" });
+    if(r.summary) out.push({ id:"sm", text:r.summary, src:"research summary" });
+    return out;
+  }
+
+  window.pdTextGen = function(p){
+    var wrap = e("div",{class:"screen"});
+    var pr = prefs();
+    var hooks = hooksFor(p);
+    var chosen = {};
+
+    // ---------- controls ----------
+    var setup = e("div",{class:"tg-card"});
+    setup.appendChild(e("div",{class:"tg-h"}, "Message setup"));
+    function sel(opts, val){
+      var s = e("select",{});
+      opts.forEach(function(o){ var op = e("option",{value:o}, o); if(o === val) op.selected = true; s.appendChild(op); });
+      return s;
+    }
+    var purposeS = sel(["First intro text","Follow-up (no reply yet)","Re-engage (gone quiet)","Webinar / What's Working Now invite","Reply to their response","Break-up (last touch)"], pr.purpose || "First intro text");
+    var lenS     = sel(["Ultra short (under 160 characters)","Short (1-2 sentences)","Medium (3-4 sentences)","Long (full paragraph)","Exact word count\u2026"], pr.len || "Short (1-2 sentences)");
+    var wordsI   = e("input",{type:"number",min:"10",max:"400",placeholder:"e.g. 45",value:pr.words || ""});
+    var toneS    = sel(["Warm & casual","Peer-to-peer","Professional","Direct / no fluff","Playful"], pr.tone || "Warm & casual");
+    var openS    = sel(["Use their first name","Straight into it","Open with a question","Lead with the specific detail"], pr.open || "Use their first name");
+    var ctaS     = sel(["Soft (worth a quick chat?)","None (just start a conversation)","Direct ask for a call","Ask a question back","Custom (write below)"], pr.cta || "None (just start a conversation)");
+    var emojiS   = sel(["No emoji","One, if it fits naturally"], pr.emoji || "No emoji");
+    var varsS    = sel(["1 variant","2 variants","3 variants"], pr.vars || "3 variants");
+    var g = e("div",{class:"tg-grid"});
+    g.appendChild(e("div",{}, e("label",{},"Purpose"), purposeS));
+    g.appendChild(e("div",{}, e("label",{},"Length"), lenS));
+    var wordsWrap = e("div",{style:"display:none"}, e("label",{},"Word count"), wordsI);
+    g.appendChild(wordsWrap);
+    g.appendChild(e("div",{}, e("label",{},"Tone"), toneS));
+    g.appendChild(e("div",{}, e("label",{},"Opening"), openS));
+    g.appendChild(e("div",{}, e("label",{},"Call to action"), ctaS));
+    g.appendChild(e("div",{}, e("label",{},"Emoji"), emojiS));
+    g.appendChild(e("div",{}, e("label",{},"Variants"), varsS));
+    setup.appendChild(g);
+    function syncWords(){ wordsWrap.style.display = (lenS.value === "Exact word count\u2026") ? "" : "none"; }
+    lenS.addEventListener("change", syncWords); syncWords();
+
+    var mustI  = e("input",{placeholder:"must include \u2014 e.g. my name, 275 BPS, \u201Cno desk fees\u201D", value: pr.must || ""});
+    var avoidI = e("input",{placeholder:"never say \u2014 e.g. recruiting, opportunity, hop on a call", value: pr.avoid || ""});
+    var extraT = e("textarea",{rows:2, placeholder:"Anything else? e.g. \u201Cmention I saw their Scotsman ranking\u201D, \u201Cwrite like a text to a peer, not a pitch\u201D"});
+    extraT.value = pr.extra || "";
+    var g2 = e("div",{class:"tg-grid",style:"margin-top:10px"});
+    g2.appendChild(e("div",{}, e("label",{},"Must include"), mustI));
+    g2.appendChild(e("div",{}, e("label",{},"Never say"), avoidI));
+    setup.appendChild(g2);
+    setup.appendChild(e("div",{style:"margin-top:10px"}, e("label",{style:"font-size:11.5px;color:var(--t-3);display:block;margin-bottom:3px"},"Extra instructions"), extraT));
+    wrap.appendChild(setup);
+
+    // ---------- research hooks ----------
+    var hookCard = e("div",{class:"tg-card"});
+    hookCard.appendChild(e("div",{class:"tg-h"}, "Reference from research \u2014 pick exactly what to use"));
+    if(!hooks.length){
+      hookCard.appendChild(e("div",{class:"tg-empty"}, p.research ? "No usable hooks in the research yet." : "No research on this prospect yet \u2014 run research first for personalized messages."));
+    } else {
+      var hb = e("div",{class:"tg-hooks"});
+      hooks.forEach(function(h){
+        var cb = e("input",{type:"checkbox"});
+        var row = e("label",{class:"tg-hook"}, cb, e("span",{}, h.text, e("span",{class:"src"}, h.src)));
+        cb.addEventListener("change", function(){
+          chosen[h.id] = cb.checked ? h.text : null;
+          row.classList.toggle("on", cb.checked);
+        });
+        hb.appendChild(row);
+      });
+      hookCard.appendChild(hb);
+      hookCard.appendChild(e("div",{class:"muted",style:"font-size:11.5px;margin-top:8px"}, "Nothing checked = the AI picks the single strongest detail itself."));
+    }
+    wrap.appendChild(hookCard);
+
+    // ---------- output ----------
+    var outCard = e("div",{class:"tg-card"});
+    outCard.appendChild(e("div",{class:"tg-h"}, "Messages"));
+    var status = e("div",{class:"muted",style:"font-size:12.5px"}, "Set it up above, then Generate.");
+    var outBox = e("div",{});
+    outCard.appendChild(status); outCard.appendChild(outBox);
+    wrap.appendChild(outCard);
+
+    function currentPrefs(){
+      return { purpose:purposeS.value, len:lenS.value, words:wordsI.value, tone:toneS.value,
+               open:openS.value, cta:ctaS.value, emoji:emojiS.value, vars:varsS.value,
+               must:mustI.value, avoid:avoidI.value, extra:extraT.value };
+    }
+    function lengthRule(){
+      if(lenS.value === "Exact word count\u2026" && wordsI.value) return "EXACTLY about " + wordsI.value + " words (within 10%).";
+      if(lenS.value.indexOf("Ultra short") === 0) return "Under 160 characters total. One SMS segment. Every word must earn its place.";
+      if(lenS.value.indexOf("Short") === 0) return "1-2 sentences.";
+      if(lenS.value.indexOf("Medium") === 0) return "3-4 sentences.";
+      return "One full paragraph, but still readable as a text message.";
+    }
+    function ctaRule(){
+      if(ctaS.value.indexOf("Soft") === 0) return "End with a soft, low-pressure ask (e.g. worth a quick chat?).";
+      if(ctaS.value.indexOf("None") === 0) return "No call-to-action. The goal is simply to start a conversation and earn a reply.";
+      if(ctaS.value.indexOf("Direct") === 0) return "End with a direct ask for a short call.";
+      if(ctaS.value.indexOf("Ask a question") === 0) return "End with a genuine question they'd want to answer.";
+      return "Use the call to action described in the extra instructions.";
+    }
+    function buildPrompt(n){
+      var picked = Object.keys(chosen).map(function(k){ return chosen[k]; }).filter(Boolean);
+      var r = p.research || {};
+      var facts = [];
+      if(p.company) facts.push("Company: " + p.company);
+      if(p.position) facts.push("Title: " + p.position);
+      if(p.market) facts.push("Market: " + p.market);
+      if(p.estProduction) facts.push("Est. production: $" + p.estProduction + "M/yr");
+      if(r.summary) facts.push("Research summary: " + r.summary);
+      var guard = (r.guardrails || []).filter(Boolean);
+      return [
+        "Write " + n + " variant" + (n>1?"s":"") + " of an outbound TEXT MESSAGE (SMS).",
+        "",
+        "FROM: " + ((state.user && state.user.name) || "Aidan Boyd") + " at Partners Mortgage.",
+        "TO: " + (p.firstName || "") + " " + (p.lastName || ""),
+        "",
+        "WHAT WE KNOW:",
+        facts.length ? facts.join("\n") : "(limited)",
+        picked.length ? ("\nREFERENCE THESE SPECIFICALLY (use them, naturally, not as a list):\n- " + picked.join("\n- ")) : "\nPick at most ONE specific detail from what we know and weave it in naturally.",
+        guard.length ? ("\nDO NOT (from research guardrails):\n- " + guard.join("\n- ")) : "",
+        "",
+        "SPEC:",
+        "Purpose: " + purposeS.value,
+        "Length: " + lengthRule(),
+        "Tone: " + toneS.value,
+        "Opening: " + openS.value,
+        "CTA: " + ctaRule(),
+        "Emoji: " + emojiS.value,
+        mustI.value.trim()  ? "MUST include: " + mustI.value.trim() : "",
+        avoidI.value.trim() ? "NEVER say: " + avoidI.value.trim() : "",
+        extraT.value.trim() ? "Extra: " + extraT.value.trim() : "",
+        "",
+        "Return ONLY the message text. " + (n > 1 ? "Separate each variant with a line containing only ---" : "No preamble, no quotes, no labels.")
+      ].filter(Boolean).join("\n");
+    }
+    var SYS = "You write outbound recruiting text messages for Partners Mortgage, a founder-led independent mortgage company (tagline: You matter). "
+      + "The recipient is a working loan officer or branch manager. These are REAL TEXTS from one industry person to another, so: "
+      + "write like a human texting, never like marketing copy. No em dashes. No links. No emoji unless asked. Never use the words recruiting, "
+      + "opportunity, or reach out. Do not pitch compensation unless explicitly instructed. Do not fabricate any detail that is not given to you. "
+      + "Contractions are good. Short sentences are good. The goal is a reply, not a sale. Return only the message text.";
+
+    function meterFor(ta){
+      var m = e("div",{class:"tg-meter"});
+      var txt = e("span",{});
+      var acts = e("div",{class:"tg-acts"});
+      m.appendChild(txt); m.appendChild(acts);
+      function upd(){
+        var i = smsInfo(ta.value);
+        txt.textContent = i.len + " chars \u00B7 " + i.seg + " SMS segment" + (i.seg===1?"":"s") + (i.uni ? " (unicode)" : "");
+        txt.className = (lenS.value.indexOf("Ultra short") === 0 && i.len > 160) ? "over" : "";
+      }
+      ta.addEventListener("input", upd); upd();
+      return { row:m, acts:acts, upd:upd };
+    }
+
+    function renderVariants(list){
+      outBox.innerHTML = "";
+      list.forEach(function(text, idx){
+        var box = e("div",{class:"tg-var"});
+        var ta = e("textarea",{});
+        ta.value = text;
+        box.appendChild(ta);
+        var mm = meterFor(ta);
+        mm.acts.appendChild(e("button",{class:"btn sm",onClick:function(){
+          if(!ta.value.trim()) return showToast("Nothing to copy");
+          if(navigator.clipboard) navigator.clipboard.writeText(ta.value).then(function(){ showToast("Copied \u2014 paste into GoHighLevel"); });
+          if(typeof logActivity === "function") logActivity(p.id, "ai-generated", "Text copied: " + ta.value.slice(0,120));
+        }},"Copy"));
+        mm.acts.appendChild(e("button",{class:"btn sm subtle",onClick:function(){ generate(1, function(one){ ta.value = one[0] || ta.value; mm.upd(); }); }},"\u21BB Reroll"));
+        mm.acts.appendChild(e("button",{class:"btn sm",style:"background:var(--brand);color:#fff",onClick:function(){
+          if(!ta.value.trim()) return showToast("Nothing to send");
+          p.textDrafts = (p.textDrafts || []).slice(0,4);
+          p.textDrafts.unshift({ at:Date.now(), by:(state.user&&state.user.name)||"", text:ta.value.slice(0,600) });
+          if(typeof logActivity === "function") logActivity(p.id, "outreach-sent", "First text sent: " + ta.value.slice(0,160));
+          if(p.stage === "waiting-first-text" && typeof window.advanceGate === "function"){ persist(); advanceGate(p); }
+          else { persist(); showToast("Logged as sent"); navigate(state.screen,{replace:true}); }
+        }},"\u2713 Mark sent"));
+        box.appendChild(mm.row);
+        outBox.appendChild(box);
+      });
+    }
+
+    function generate(n, cb){
+      savePrefs(currentPrefs());
+      var count = n || parseInt(varsS.value, 10) || 1;
+      status.textContent = "Writing " + count + " version" + (count>1?"s":"") + "\u2026";
+      callAnthropic(buildPrompt(count), { system: SYS, maxTokens: 1200, label: "Text gen: " + (p.firstName||"") })
+        .then(function(txt){
+          var parts = String(txt || "").split(/\n\s*---\s*\n/).map(function(x){ return x.trim(); }).filter(Boolean);
+          if(!parts.length) parts = [String(txt||"").trim()];
+          status.textContent = "Edit anything below, then Copy or Mark sent.";
+          if(cb) cb(parts); else renderVariants(parts);
+        })
+        .catch(function(err){ status.textContent = "Couldn't generate \u2014 " + ((err && err.message) || "check connection") + "."; });
+    }
+
+    var bar = e("div",{style:"display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px"});
+    bar.appendChild(e("button",{class:"btn",style:"background:var(--brand);color:#fff",onClick:function(){ generate(); }}, "\u2726 Generate"));
+    bar.appendChild(e("button",{class:"btn subtle",onClick:function(){ savePrefs(currentPrefs()); showToast("Setup saved as your default"); }}, "Save as my default"));
+    wrap.insertBefore(bar, wrap.firstChild);
+
+    // previously sent
+    if((p.textDrafts || []).length){
+      var hist = e("div",{class:"tg-card"});
+      hist.appendChild(e("div",{class:"tg-h"}, "Previously sent"));
+      p.textDrafts.forEach(function(d){
+        hist.appendChild(e("div",{style:"font-size:12.5px;line-height:1.5;padding:8px 0;border-bottom:1px solid var(--line)"},
+          e("div",{}, d.text),
+          e("div",{class:"muted",style:"font-size:11px;margin-top:3px"}, (d.by || "") + " \u00B7 " + new Date(d.at).toLocaleDateString("en-US",{month:"short",day:"numeric"}))
+        ));
+      });
+      wrap.appendChild(hist);
+    }
+    return wrap;
+  };
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — FLOW 2.0 BULK MIGRATION (one time)
+     Only prospects sitting in ENGAGING or ENGAGED move into
+     "Awaiting LinkedIn Acceptance" — under the old cadences the
+     first step WAS the LinkedIn connection request, so those two
+     groups are genuinely waiting on an accept. Everyone else
+     stays exactly where they are: New, the gate stages, custom
+     columns (Webinar Leads), LOI Out, Closed/Joined and Long
+     Term Nurture are all left untouched.
+     Self-healing: if an earlier build ran a broader sweep, this
+     first puts those prospects back where they came from, then
+     applies the correct narrow move. Every move records the
+     prior stage, so it stays fully reversible from Settings.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+  var TARGET = "awaiting-li-accept";
+  var MOVE_FROM = ["engaging", "engaged"];   // ONLY these two move
+
+  function runBulkMigration(){
+    try{
+      if(!state || !state.user) return false;
+      if(!getStages().some(function(s){ return s && s.id === TARGET; })) return false; // stages not ready yet
+      var moved = 0, reverted = 0, marked = 0;
+      (state.prospects || []).forEach(function(p){
+        if(!p || p._flow2v2) return;     // already handled on some device — one time only
+        // Undo any earlier, broader sweep before deciding fresh.
+        if(p._preFlow2Stage){
+          p.stage = p._preFlow2Stage;
+          delete p._preFlow2Stage;
+          reverted++;
+        }
+        delete p._flow2;
+        p._flow2v2 = 1; marked++;
+        if(p.stagePinned) return;                      // pinned (e.g. webinar leads) never auto-move
+        if(MOVE_FROM.indexOf(p.stage) === -1) return;   // everyone else stays put
+        p._preFlow2Stage = p.stage;      // remembered so the move can be undone
+        p.stage = TARGET;
+        if(!Array.isArray(p.stagesSeen)) p.stagesSeen = [];
+        if(p.stagesSeen.indexOf(TARGET) === -1) p.stagesSeen.push(TARGET);
+        moved++;
+      });
+      if(marked){
+        if(moved && typeof logActivity === "function"){
+          logActivity(null, "stage-change", "Flow 2.0 migration: moved " + moved + " Engaging/Engaged prospects to Awaiting LinkedIn Acceptance");
+        }
+        persist();
+        if(moved || reverted){
+          if(typeof showToast === "function"){
+            showToast("Moved " + moved + " Engaging/Engaged prospects to Awaiting LinkedIn Acceptance" + (reverted ? " (and undid the earlier broader move)" : ""));
+          }
+          if(typeof navigate === "function") navigate(state.screen, { replace:true });
+        }
+      }
+      return true;
+    }catch(e){ console.error("flow2 bulk migration", e); return false; }
+  }
+  window.__flow2Migrate = runBulkMigration;
+
+  window.__flow2Undo = function(){
+    var back = 0;
+    (state.prospects || []).forEach(function(p){
+      if(p && p._preFlow2Stage){ p.stage = p._preFlow2Stage; delete p._preFlow2Stage; back++; }
+      if(p){ delete p._flow2; delete p._flow2v2; }
+    });
+    persist();
+    if(typeof showToast === "function") showToast(back ? ("Reverted " + back + " prospects to their previous stages") : "Nothing to revert");
+    if(typeof navigate === "function") navigate(state.screen, { replace:true });
+  };
+
+  // Run once the user is signed in and the stage list is in place.
+  (function schedule(){
+    var tries = 0;
+    var iv = setInterval(function(){
+      tries++;
+      if(runBulkMigration() || tries > 60) clearInterval(iv);
+    }, 700);
+  })();
+
+  // Undo control in Settings.
+  if(typeof window.viewSettings === "function"){
+    var _vs = window.viewSettings;
+    window.viewSettings = function(){
+      var wrap = _vs.apply(this, arguments);
+      try{
+        var n = (state.prospects || []).filter(function(p){ return p && p._preFlow2Stage; }).length;
+        if(n){
+          var card = e("div",{class:"card",style:"margin-top:12px"});
+          card.appendChild(e("h3",{style:"margin:0 0 8px;font-size:14px"}, "Flow 2.0 migration"));
+          card.appendChild(e("p",{class:"muted",style:"font-size:12.5px;margin:0 0 10px;line-height:1.55"},
+            n + " prospect" + (n===1?" that was":"s that were") + " in Engaging or Engaged moved into Awaiting LinkedIn Acceptance when the new flow went live. Everyone else was left where they were. You can put them all back exactly where they came from."));
+          card.appendChild(e("button",{class:"btn sm",onClick:function(){
+            uiConfirm("Undo the Flow 2.0 move for " + n + " prospects?", function(){ window.__flow2Undo(); },
+              { title:"Undo migration", okLabel:"Undo move" });
+          }}, "\u21A9 Undo migration"));
+          wrap.appendChild(card);
+        }
+      }catch(err){ console.error("flow2 undo card", err); }
+      return wrap;
+    };
+  }
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — WEBINAR LEADS (holding area, outside the pipeline)
+     Webinar Leads is NOT a pipeline stage. It's a separate holding
+     list: leads land there, research runs on them automatically,
+     and they sit untouched until you choose to add them to the
+     pipeline. Reached from the "Webinar Leads" button on the
+     pipeline and dashboard headers.
+     ============================================================ -->
+<style>
+  .wl-bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+  .wl-row{display:flex;align-items:center;gap:12px;padding:11px 13px;border:1px solid var(--line);border-radius:12px;background:var(--surface);margin-bottom:8px}
+  .wl-row:hover{border-color:#d946ef}
+  .wl-av{width:34px;height:34px;border-radius:50%;background:rgba(217,70,239,.12);color:#a21caf;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;flex:0 0 auto}
+  .wl-main{flex:1;min-width:0}
+  .wl-name{font-weight:700;font-size:14px}
+  .wl-sub{font-size:12px;color:var(--t-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .wl-tag{font-size:10.5px;padding:2px 7px;border-radius:999px;border:1px solid var(--line);color:var(--t-3);white-space:nowrap}
+  .wl-tag.ok{color:#15803d;border-color:rgba(21,128,61,.35);background:rgba(21,128,61,.07)}
+  .wl-tag.wait{color:#a16207;border-color:rgba(161,98,7,.35);background:rgba(161,98,7,.07)}
+  .wl-acts{display:flex;gap:6px;flex-wrap:wrap;flex:0 0 auto}
+  @media(max-width:640px){ .wl-row{flex-wrap:wrap} .wl-acts{width:100%} }
+</style>
+<script>
+(function(){
+  "use strict";
+
+  // Stages held OUTSIDE the pipeline (not shown as funnel bands / board columns).
+  window.isHoldingStage = function(id){
+    if(!id) return false;
+    if(id === "webinar-leads") return true;
+    var st = (typeof getStages === "function" ? getStages() : (state.stages || []))
+              .find(function(s){ return s && s.id === id; });
+    return !!(st && /webinar/i.test(String(st.label || "")));
+  };
+
+  // Find (or create) the Webinar Leads holding list. Matched by LABEL so a
+  // recreated/renamed column still resolves.
+  function webinarStageId(createIfMissing){
+    var stages = (typeof getStages === "function") ? getStages() : (state.stages || []);
+    var hit = stages.find(function(s){ return s && /webinar/i.test(String(s.label || "")); });
+    if(hit) return hit.id;
+    if(!createIfMissing) return null;
+    var id = "webinar-leads";
+    var list = Array.isArray(state.stages) && state.stages.length ? state.stages.slice() : stages.slice();
+    if(!list.some(function(s){ return s && s.id === id; })){
+      var at = list.findIndex(function(s){ return s && s.id === "new"; });
+      var entry = { id:id, label:"Webinar Leads" };
+      if(at === -1) list.unshift(entry); else list.splice(at + 1, 0, entry);
+      state.stages = list;
+      persist();
+    }
+    return id;
+  }
+  window.webinarStageId = webinarStageId;
+  try{ STAGE_COLORS["webinar-leads"] = "#d946ef"; }catch(e){}
+
+  function webinarLeads(){
+    var sid = webinarStageId(false);
+    if(!sid) return [];
+    return (state.prospects || []).filter(function(p){ return p && p.stage === sid; });
+  }
+
+  window.addWebinarLead = function(){
+    openProspectModal(null, {
+      defaultStage: webinarStageId(true),
+      source: "Webinar",
+      title: "Add webinar lead",
+      pin: true
+    });
+  };
+
+  // Move a lead OUT of the holding area and into the live pipeline.
+  window.promoteWebinarLead = function(p, stageId){
+    p.stagePinned = false;                   // hand them to the normal flow
+    p.stage = stageId || "new";
+    p.stageEnteredAt = Date.now();
+    if(!Array.isArray(p.stagesSeen)) p.stagesSeen = [];
+    if(p.stagesSeen.indexOf(p.stage) === -1) p.stagesSeen.push(p.stage);
+    if(typeof logActivity === "function") logActivity(p.id, "stage-change", "Webinar Leads \u2192 " + getStageLabel(p.stage));
+    persist();
+    if(typeof showToast === "function") showToast((p.firstName||"") + " added to the pipeline");
+    if(typeof navigate === "function") navigate(state.screen, { replace:true });
+  };
+
+  function promotePicker(p){
+    showModal("Add to pipeline \u2014 " + (p.firstName||"") + " " + (p.lastName||""), function(modal, close){
+      modal.appendChild(e("p",{class:"muted",style:"font-size:13px;line-height:1.55;margin:0 0 12px"},
+        "Pick where they enter. New Prospect starts them at the top of the flow; research is already done, so they'll move to Waiting for First Text on their own."));
+      var sel = e("select",{});
+      getStages().forEach(function(s){
+        if(window.isHoldingStage(s.id)) return;
+        var o = e("option",{value:s.id}, s.label);
+        if(s.id === "new") o.selected = true;
+        sel.appendChild(o);
+      });
+      modal.appendChild(sel);
+      modal.appendChild(e("div",{class:"modal-actions"},
+        e("button",{class:"btn ghost",onClick:close},"Cancel"),
+        e("button",{class:"btn",style:"background:var(--brand);color:#fff",onClick:function(){
+          close(); window.promoteWebinarLead(p, sel.value);
+        }},"Add to pipeline")
+      ));
+    });
+  }
+
+  window.viewWebinarLeads = function(){
+    var wrap = e("div",{class:"screen"});
+    var list = webinarLeads().slice().sort(function(a,b){ return (b.createdAt||0) - (a.createdAt||0); });
+    wrap.appendChild(e("div",{class:"h-section"},
+      e("div",{},
+        e("h2",{},"Webinar Leads"),
+        e("div",{class:"sub"}, list.length + " lead" + (list.length===1?"":"s") + " held outside the pipeline")
+      ),
+      e("div",{class:"actions"},
+        e("button",{class:"btn sm",style:"background:#d946ef;color:#fff;border-color:#d946ef",onClick:function(){ window.addWebinarLead(); }}, "+ Add webinar lead"),
+        e("button",{class:"btn sm subtle",onClick:function(){ navigate("prospects"); }}, "\u2190 Pipeline")
+      )
+    ));
+    wrap.appendChild(e("p",{class:"muted",style:"font-size:12.5px;line-height:1.55;margin:0 0 14px"},
+      "These sit here untouched \u2014 research runs automatically, but nothing moves them. Add them to the pipeline whenever you're ready."));
+
+    if(!list.length){
+      wrap.appendChild(e("div",{class:"empty"}, e("div",{class:"ic"},"\u00B7"), "No webinar leads yet."));
+      return wrap;
+    }
+    list.forEach(function(p){
+      var researched = !!(p.research && !p.research.error);
+      var ini = ((p.firstName||"?").charAt(0) + (p.lastName||"").charAt(0)).toUpperCase();
+      var row = e("div",{class:"wl-row"});
+      row.appendChild(e("div",{class:"wl-av"}, ini));
+      row.appendChild(e("div",{class:"wl-main",style:"cursor:pointer",onClick:function(){ navigate("prospect:"+p.id); }},
+        e("div",{class:"wl-name"}, (p.firstName||"") + " " + (p.lastName||"")),
+        e("div",{class:"wl-sub"}, [p.company, p.market, p.linkedin ? "LinkedIn \u2713" : null].filter(Boolean).join(" \u00B7 ") || "\u2014")
+      ));
+      row.appendChild(e("span",{class:"wl-tag " + (researched ? "ok" : "wait")}, researched ? "Researched" : "Research pending"));
+      var acts = e("div",{class:"wl-acts"});
+      if(!researched){
+        acts.appendChild(e("button",{class:"btn sm subtle",onClick:function(){ if(typeof runResearch === "function") runResearch(p); }}, "\u21BB Research"));
+      }
+      acts.appendChild(e("button",{class:"btn sm",style:"background:var(--brand);color:#fff",onClick:function(){ promotePicker(p); }}, "\u2192 Add to pipeline"));
+      row.appendChild(acts);
+      wrap.appendChild(row);
+    });
+    return wrap;
+  };
+
+  // Entry button (with live count) on the pipeline and dashboard headers.
+  function navBtn(){
+    var n = webinarLeads().length;
+    return e("button",{class:"btn sm",style:"background:#d946ef;color:#fff;border-color:#d946ef",
+      onClick:function(){ navigate("webinar"); }}, "Webinar Leads" + (n ? " (" + n + ")" : ""));
+  }
+  if(typeof window.viewProspects === "function"){
+    var _vp = window.viewProspects;
+    window.viewProspects = function(){
+      var v = _vp.apply(this, arguments);
+      try{
+        var acts = v.querySelector(".h-section .actions") || v.querySelector(".h-section > div:last-child");
+        if(acts) acts.insertBefore(navBtn(), acts.firstChild);
+      }catch(e){ console.error("webinar nav btn", e); }
+      return v;
+    };
+  }
+  if(typeof window.viewDashboard === "function"){
+    var _vd = window.viewDashboard;
+    window.viewDashboard = function(){
+      var v = _vd.apply(this, arguments);
+      try{
+        var acts = v.querySelector(".h-section .actions");
+        if(acts) acts.appendChild(navBtn());
+      }catch(e){}
+      return v;
+    };
+  }
+
+  // One-time: pin everyone already sitting in the holding list.
+  (function schedule(){
+    var tries = 0;
+    var iv = setInterval(function(){
+      tries++;
+      try{
+        if(state && state.user){
+          clearInterval(iv);
+          var sid = webinarStageId(false);
+          if(sid){
+            var n = 0;
+            (state.prospects || []).forEach(function(p){
+              if(p && p.stage === sid && !p.stagePinned){ p.stagePinned = true; n++; }
+            });
+            if(n) persist();
+          }
+        } else if(tries > 60){ clearInterval(iv); }
+      }catch(e){ clearInterval(iv); }
+    }, 700);
+  })();
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — RESEARCH EXPIRY (10 days in Closed / Nurture)
+     Once someone has sat in Closed/Joined or Long Term Nurture
+     for 10 days, their RESEARCH DOSSIER is deleted. That's it.
+     The prospect card is untouched: name, company, volume, NMLS,
+     dates, notes, files, activity and cadence all stay.
+     Research is the heavy part, so this is where the size goes.
+     Merge-proof: other devices adopt the deletion and can never
+     resurrect the dossier. Re-running research restores it and
+     restarts the 10-day clock.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+  var EXPIRY_DAYS = 10;
+  var EXPIRY_MS = EXPIRY_DAYS * 86400000;
+  var STAGES = ["closed", "nurture"];
+
+  function enteredAt(p){
+    if(typeof p.stageEnteredAt === "number") return p.stageEnteredAt;
+    if(p.stage === "closed" && typeof p.hireDate === "number") return p.hireDate;
+    return null; // unknown — clock starts now (stamped below)
+  }
+
+  function expireOne(p){
+    // ONLY the research dossier goes. The prospect card and everything else
+    // on it (notes, activity, cadence, files, dates, volume) stays exactly
+    // as it is.
+    delete p.research;
+    p.dataExpired = Date.now();
+  }
+
+  function runExpiry(){
+    try{
+      if(!state || !state.user) return false;
+      var now = Date.now(), expired = 0, stamped = 0;
+      (state.prospects || []).forEach(function(p){
+        if(!p || STAGES.indexOf(p.stage) === -1 || p.dataExpired) return;
+        var t = enteredAt(p);
+        if(t == null){ p.stageEnteredAt = now; stamped++; return; } // clock starts today
+        if(now - t >= EXPIRY_MS){ expireOne(p); expired++; }
+      });
+      if(expired){
+        if(typeof logActivity === "function") logActivity(null, "note", "Cleared research on " + expired + " prospect" + (expired===1?"":"s") + " after " + EXPIRY_DAYS + " days in Closed/Nurture");
+        persist();
+        if(typeof showToast === "function") showToast("Cleared research on " + expired + " prospect" + (expired===1?"":"s") + " (10-day expiry)");
+      } else if(stamped){
+        persist();
+      }
+      return true;
+    }catch(e){ console.error("data expiry", e); return false; }
+  }
+  window.__runDataExpiry = runExpiry;
+
+  (function schedule(){
+    var tries = 0;
+    var iv = setInterval(function(){
+      tries++;
+      if(runExpiry() || tries > 60) clearInterval(iv);
+    }, 900);
+  })();
 })();
 </script>
 </body>
