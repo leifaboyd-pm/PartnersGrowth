@@ -15855,6 +15855,7 @@ async function syncFromCloudOnBoot(){
   if(Array.isArray(cloud.expiredActs) && cloud.expiredActs.length){
     state.expiredActs = Array.from(new Set((state.expiredActs || []).concat(cloud.expiredActs))).slice(-1000);
   }
+  if(cloud.flow2Migration && !state.flow2Migration) state.flow2Migration = cloud.flow2Migration;
   const bootMerged = (typeof window.__rosMerge === "function")
     ? window.__rosMerge(state.prospects || [], cloud.prospects || [], state.deletedIds || [], cloud.deletedIds || [], cloudTime > localTime)
     : null;
@@ -25399,7 +25400,10 @@ if(params.get("u") && params.get("pin")){
       if(typeof hideProFormaScreen === "function") hideProFormaScreen();
       const main = $("#main");
       main.innerHTML = "";
-      main.appendChild(viewWorkNow());
+      // Use the LAST registered implementation. This router previously called
+      // the closure-local viewWorkNow, which silently shadowed every later
+      // override and made them dead code.
+      main.appendChild((window.viewWorkNow || viewWorkNow)());
       $("#tb-title").textContent = "What to Work on Now";
       if(typeof syncRailActive === "function") syncRailActive();
       if(typeof footnote === "function") main.appendChild(footnote());
@@ -25470,6 +25474,7 @@ if(params.get("u") && params.get("pin")){
     if(Array.isArray(cloud.expiredActs) && cloud.expiredActs.length){
       state.expiredActs = Array.from(new Set((state.expiredActs || []).concat(cloud.expiredActs))).slice(-1000);
     }
+    if(cloud.flow2Migration && !state.flow2Migration) state.flow2Migration = cloud.flow2Migration;
     var merged = (typeof window.__rosMerge === "function")
       ? window.__rosMerge(state.prospects || [], incoming, state.deletedIds || [], cloud.deletedIds || [], newer)
       : null;
@@ -25905,159 +25910,152 @@ if(params.get("u") && params.get("pin")){
   var goIcon = '<span class="wwon-go"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg></span>';
 
   // Dashboard panel — preview of active-cadence touches due now (LOI etc. live on the full page).
+  /* ---- ONE shared calculation feeding both the dashboard summary and the
+     full page, so the counts outside can never disagree with the lists inside. ---- */
+  function wwonBuckets(prospects){
+    var mine = prospects || [];
+    var engaging = [], engaged = [], loi = [];
+    mine.forEach(function(p){
+      if(!p) return;
+      if(window.isDNC && isDNC(p)) return;
+      var t = null;
+      try { t = touchReadyNow(p); } catch(err){}
+      if(p.stage === "engaging"){
+        if(t && !hasCallScheduled(p)) engaging.push({ p:p, t:t });
+      } else if(p.stage === "engaged"){
+        if(t) engaged.push({ p:p, t:t });
+      }
+    });
+    try { loi = keepWarmGroup(mine, "loi") || []; } catch(err){ loi = []; }
+    function byDue(a,b){ return ((a.t && a.t.unlockAt) || 0) - ((b.t && b.t.unlockAt) || 0); }
+    engaging.sort(byDue); engaged.sort(byDue);
+    return { engaging:engaging, engaged:engaged, loi:loi,
+             total: engaging.length + engaged.length + loi.length };
+  }
+  window.wwonBuckets = wwonBuckets;
+
+  var WWON_CATS = [
+    { key:"engaging", label:"Engaging",  note:"touches due" },
+    { key:"engaged",  label:"Engaged",   note:"next steps due" },
+    { key:"loi",      label:"LOI out",   note:"keep warm" }
+  ];
+
+  /* ---- DASHBOARD: three categories with counts. No people, just the numbers. ---- */
   window.renderWhoToReachNext = function(prospects){
-    var main = mainReady(prospects);
+    var b = wwonBuckets(prospects);
     var panel = e("div",{class:"intel-panel"});
     panel.appendChild(e("button",{class:"intel-head wwon-head", title:"See everything to work on", onClick:function(){ navigate("work-now"); }},
       htmlNode(checklistIcon),
       e("div",{class:"intel-titles"},
         e("div",{class:"intel-title"},"What to Work on Now"),
-        e("div",{class:"intel-sub"}, main.length ? (main.length + (main.length===1?" touch":" touches") + " due in your active cadences") : "Open your daily work list")
+        e("div",{class:"intel-sub"}, b.total ? (b.total + (b.total===1?" item":" items") + " due") : "Nothing due right now")
       ),
       htmlNode(goIcon)
     ));
-    if(main.length){
-      main.slice(0,6).forEach(function(x){ panel.appendChild(workRow(x.p, x.t)); });
-    } else {
-      panel.appendChild(e("div",{class:"intel-empty"}, "No active-cadence touches due right now — tap to see calls set and keep-warm."));
-    }
+    var cats = e("div",{class:"wwon-cats"});
+    WWON_CATS.forEach(function(c){
+      var n = b[c.key].length;
+      cats.appendChild(e("button",{class:"wwon-cat" + (n ? "" : " zero"), onClick:function(){
+        window._wwonFocus = c.key;
+        navigate("work-now");
+      }},
+        e("span",{class:"wwon-dot", style:"background:" + ((typeof stageColor === "function") ? stageColor(c.key === "loi" ? "loi" : c.key) : "var(--brand)")}),
+        e("span",{class:"wwon-cat-label"}, c.label),
+        e("span",{class:"wwon-cat-note"}, c.note),
+        e("span",{class:"wwon-cat-n"}, String(n))
+      ));
+    });
+    panel.appendChild(cats);
     return panel;
   };
 
-  // Full page. THE FRONT IS ENGAGING ONLY — touches we owe people in the
-  // Engaging stage, most overdue first. Everything else lives in clearly
-  // separated sections below it.
+  /* ---- FULL PAGE: the same three categories, each with its due tasks. ---- */
   window.viewWorkNow = function(){
     var wrap = e("div",{class:"screen"});
     var mine = myProspectsList();
-
-    // ---- FRONT: Engaging touches due now ----
-    var engaging = [];
-    mine.forEach(function(p){
-      if(!p || p.stage !== "engaging") return;
-      if(window.isDNC && isDNC(p)) return;
-      if(hasCallScheduled(p)) return;              // a booked call lives on the closing checklist
-      var t = touchReadyNow(p);
-      if(t) engaging.push({ p:p, t:t });
-    });
-    engaging.sort(function(a,b){ return (a.t.unlockAt || 0) - (b.t.unlockAt || 0); }); // most overdue first
+    var b = wwonBuckets(mine);
 
     wrap.appendChild(e("div",{class:"h-section"},
       e("div",{},
         e("h2",{},"What to Work on Now"),
-        e("div",{class:"sub"}, engaging.length + (engaging.length===1?" touch":" touches") + " due in Engaging \u2014 most overdue first")
+        e("div",{class:"sub"}, b.total ? (b.total + (b.total===1?" item":" items") + " due \u00B7 Engaging " + b.engaging.length + " \u00B7 Engaged " + b.engaged.length + " \u00B7 LOI " + b.loi.length) : "Nothing due right now")
       )
     ));
-    if(!engaging.length){
-      wrap.appendChild(e("div",{class:"empty",style:"margin-top:20px"}, e("div",{class:"ic"},"\u2713"), "No Engaging touches due right now."));
-    } else {
-      var panel = e("div",{class:"intel-panel"});
-      engaging.forEach(function(x){ panel.appendChild(workRow(x.p, x.t)); });
-      wrap.appendChild(panel);
+
+    if(!b.total){
+      wrap.appendChild(e("div",{class:"empty",style:"margin-top:20px"}, e("div",{class:"ic"},"\u2713"), "All caught up."));
+      return wrap;
     }
 
-    function head(title, n){
-      return e("div",{class:"wn-group-head"},
-        e("h3",{}, title),
+    function section(key, label, sub, n){
+      var h = e("div",{class:"wn-group-head"},
+        e("h3",{}, label),
         e("span",{class:"wn-count"}, String(n))
       );
+      h.id = "wwon-" + key;
+      wrap.appendChild(h);
+      if(sub) wrap.appendChild(e("div",{class:"muted",style:"font-size:12px;margin:-2px 0 8px"}, sub));
     }
 
-    // ---- ENGAGED: next step for each ----
-    var engaged = mine.filter(function(p){ return p && p.stage === "engaged" && !(window.isDNC && isDNC(p)); });
-    if(engaged.length){
-      wrap.appendChild(head("Engaged \u2014 next steps", engaged.length));
-      var ep = e("div",{class:"intel-panel"});
-      engaged.forEach(function(p){
-        var step = "";
-        if(p.nextStep && String(p.nextStep).trim()) step = String(p.nextStep).trim();
-        else {
-          var t = null;
-          try { t = touchReadyNow(p) || (typeof currentTask === "function" ? currentTask(p) : null); } catch(err){}
-          if(t && t.action) step = t.action;
-        }
-        if(!step) step = "No next step set \u2014 open to set one";
-        var due = null;
-        try { due = touchReadyNow(p); } catch(err){}
-        var row = e("button",{class:"intel-row",onClick:function(){ navigate("prospect:"+p.id); }},
-          e("div",{class:"intel-rank k-info"}, htmlNode(intelKindIcon("info"))),
-          e("div",{class:"intel-main"},
-            e("div",{class:"intel-name"}, (p.firstName||"") + " " + (p.lastName||""),
-              p.company ? e("span",{class:"intel-co"}, " \u00B7 " + p.company) : null),
-            e("div",{class:"intel-reason"}, step)
-          ),
-          due ? e("span",{class:"pill warn",style:"flex:0 0 auto"}, "touch due") : null
-        );
-        ep.appendChild(row);
+    // 1) ENGAGING — cadence touches due, most overdue first
+    if(b.engaging.length){
+      section("engaging", "Engaging \u2014 touches due", "Most overdue first.", b.engaging.length);
+      var p1 = e("div",{class:"intel-panel"});
+      b.engaging.forEach(function(x){ p1.appendChild(workRow(x.p, x.t)); });
+      wrap.appendChild(p1);
+    }
+
+    // 2) ENGAGED — playbook next step due
+    if(b.engaged.length){
+      section("engaged", "Engaged \u2014 next steps", "Peter's playbook. Each one's next move.", b.engaged.length);
+      var p2 = e("div",{class:"intel-panel"});
+      b.engaged.forEach(function(x){
+        var row = workRow(x.p, x.t);
+        try{
+          if(x.p.nextStep && String(x.p.nextStep).trim()){
+            var reason = row.querySelector(".intel-reason");
+            if(reason) reason.textContent = String(x.p.nextStep).trim();
+          }
+        }catch(err){}
+        p2.appendChild(row);
       });
-      wrap.appendChild(ep);
+      wrap.appendChild(p2);
     }
 
-    // ---- LOI OUT: keep them warm ----
-    var loi = mine.filter(function(p){ return p && p.stage === "loi" && !(window.isDNC && isDNC(p)); });
-    loi.sort(function(a,b){ return (a.lastContact||0) - (b.lastContact||0); }); // quietest first
-    if(loi.length){
-      wrap.appendChild(head("LOI out \u2014 keep warm", loi.length));
-      wrap.appendChild(e("div",{class:"muted",style:"font-size:12px;margin:-2px 0 8px"},
-        "Offer is out. Stay in touch so it doesn't go cold."));
-      var lp = e("div",{class:"intel-panel"});
-      loi.forEach(function(p){
-        var quiet = p.lastContact ? Math.floor((Date.now() - p.lastContact) / 86400000) : null;
-        var since = p.loiOutDate ? Math.floor((Date.now() - p.loiOutDate) / 86400000) : null;
-        var bits = [];
-        if(since != null) bits.push("LOI out " + since + "d ago");
-        bits.push(quiet == null ? "no contact logged" : ("last contact " + quiet + "d ago"));
-        lp.appendChild(e("button",{class:"intel-row",onClick:function(){ navigate("prospect:"+p.id); }},
-          e("div",{class:"intel-rank k-warn"}, htmlNode(intelKindIcon("warn"))),
-          e("div",{class:"intel-main"},
-            e("div",{class:"intel-name"}, (p.firstName||"") + " " + (p.lastName||""),
-              p.company ? e("span",{class:"intel-co"}, " \u00B7 " + p.company) : null),
-            e("div",{class:"intel-reason"}, bits.join(" \u00B7 "))
-          ),
-          (quiet != null && quiet >= 3) ? e("span",{class:"pill bad",style:"flex:0 0 auto"}, "going quiet") : null
-        ));
+    // 3) LOI OUT — keep warm
+    if(b.loi.length){
+      section("loi", "LOI out \u2014 keep warm", "Offer is out. Stay in touch so it doesn't go cold.", b.loi.length);
+      var p3 = e("div",{class:"intel-panel"});
+      b.loi.forEach(function(p){ p3.appendChild(keepWarmRow(p)); });
+      wrap.appendChild(p3);
+    }
+
+    // Jump to the category tapped on the dashboard.
+    if(window._wwonFocus){
+      var key = window._wwonFocus; window._wwonFocus = null;
+      requestAnimationFrame(function(){
+        try{
+          var el = document.getElementById("wwon-" + key);
+          if(el) el.scrollIntoView({ behavior:"smooth", block:"start" });
+        }catch(err){}
       });
-      wrap.appendChild(lp);
     }
-
-    // ---- WAITING ON US: the LinkedIn/first-text gates ----
-    var gates = mine.filter(function(p){
-      return p && (p.stage === "waiting-first-text" || p.stage === "waiting-li-send") && !(window.isDNC && isDNC(p));
-    });
-    if(gates.length){
-      wrap.appendChild(head("Waiting on us", gates.length));
-      var gp2 = e("div",{class:"intel-panel"});
-      gates.forEach(function(p){
-        var q = (window.STAGE_GATES && window.STAGE_GATES[p.stage]) ? window.STAGE_GATES[p.stage].q : getStageLabel(p.stage);
-        gp2.appendChild(e("button",{class:"intel-row",onClick:function(){ navigate("prospect:"+p.id); }},
-          e("div",{class:"intel-rank k-info"}, htmlNode(intelKindIcon("info"))),
-          e("div",{class:"intel-main"},
-            e("div",{class:"intel-name"}, (p.firstName||"") + " " + (p.lastName||""),
-              p.company ? e("span",{class:"intel-co"}, " \u00B7 " + p.company) : null),
-            e("div",{class:"intel-reason"}, q)
-          )
-        ));
-      });
-      wrap.appendChild(gp2);
-    }
-
-    // ---- Calls set — closing checklist ----
-    var callsSet = mine.filter(function(p){ return hasCallScheduled(p) && p.stage !== "closed"; });
-    callsSet.sort(function(a,b){ return closingProgress(a).done - closingProgress(b).done; }); // least progress first
-    if(callsSet.length){
-      wrap.appendChild(head("Calls set \u2014 closing checklist", callsSet.length));
-      var csp = e("div",{class:"intel-panel"});
-      callsSet.forEach(function(p){ csp.appendChild(callsSetRow(p)); });
-      wrap.appendChild(csp);
-    }
-
     return wrap;
   };
 
   // section-header styling
   (function(){
     var st = document.createElement("style");
-    st.textContent = ".wn-group-head{display:flex;align-items:center;gap:10px;margin:22px 0 8px}.wn-group-head h3{margin:0;font-size:14px;font-family:var(--font-h);color:var(--t-1)}.wn-group-head .wn-count{font-size:11px;font-weight:700;color:var(--brand-2);background:var(--brand-soft);border-radius:999px;padding:2px 9px}";
+    st.textContent = ".wn-group-head{display:flex;align-items:center;gap:10px;margin:22px 0 8px;scroll-margin-top:80px}.wn-group-head h3{margin:0;font-size:14px;font-family:var(--font-h);color:var(--t-1)}.wn-group-head .wn-count{font-size:11px;font-weight:700;color:var(--brand-2);background:var(--brand-soft);border-radius:999px;padding:2px 9px}"
+      + ".wwon-cats{display:flex;flex-direction:column}"
+      + ".wwon-cat{display:flex;align-items:center;gap:10px;width:100%;padding:12px 14px;background:none;border:none;border-top:1px solid var(--line);cursor:pointer;text-align:left;transition:background .15s}"
+      + ".wwon-cat:hover{background:var(--surface-2)}"
+      + ".wwon-cat.zero{opacity:.5}"
+      + ".wwon-dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}"
+      + ".wwon-cat-label{font-size:13.5px;font-weight:700;color:var(--t-1)}"
+      + ".wwon-cat-note{font-size:11.5px;color:var(--t-3)}"
+      + ".wwon-cat-n{margin-left:auto;font-size:15px;font-weight:800;font-variant-numeric:tabular-nums;color:var(--t-1);min-width:22px;text-align:right}"
+      + ".wwon-cat.zero .wwon-cat-n{color:var(--t-3)}";
     document.head.appendChild(st);
   })();
 
@@ -27850,6 +27848,7 @@ if(params.get("u") && params.get("pin")){
       var out = _stp.apply(this, arguments);
       out.deletedIds = (state.deletedIds || []).slice(-500); // cap growth
       out.expiredActs = (state.expiredActs || []).slice(-1000); // prospects whose activity history has expired
+      if(state.flow2Migration) out.flow2Migration = state.flow2Migration; // one-time migration receipt
       return out;
     };
   }
@@ -28328,7 +28327,7 @@ if(params.get("u") && params.get("pin")){
 <script>
 (function(){
   "use strict";
-  window.__ROS_BUILD = "Build 2026-07-29S \u2014 pink webinar leads + Work Now sections";
+  window.__ROS_BUILD = "Build 2026-07-29V \u2014 migration runs once + funnel search";
   try { console.log("[RecruitOS] " + window.__ROS_BUILD); } catch(e){}
   if(typeof window.viewSettings === "function"){
     var _vs = window.viewSettings;
@@ -28664,40 +28663,70 @@ if(params.get("u") && params.get("pin")){
     }
     function funnelView(){
       var wrap = e("div",{class:"screen"});
+      var q = "";
+      var bands = e("div",{});
+      var search = e("input",{type:"search", placeholder:"Search anyone in the pipeline\u2026", style:"max-width:280px"});
+      var clear = e("button",{class:"btn sm subtle",style:"display:none",onClick:function(){ search.value=""; q=""; clear.style.display="none"; draw(); }},"Clear");
+
       wrap.appendChild(e("div",{class:"h-section"},
         e("div",{}, e("h2",{},"Pipeline"), e("div",{class:"sub"},"Tap a stage to open it full screen")),
-        e("div",{class:"actions"}, toggleBtn("funnel"))
+        e("div",{class:"actions",style:"display:flex;gap:8px;align-items:center;flex-wrap:wrap"}, search, clear, toggleBtn("funnel"))
       ));
-      var byStage = {};
-      (state.prospects || []).forEach(function(p){ if(!p) return; (byStage[p.stage] = byStage[p.stage] || []).push(p); });
-      getStages().forEach(function(stg){
-        if(window.isHoldingStage && window.isHoldingStage(stg.id)) return;  // held outside the pipeline
-        var ppl = (byStage[stg.id] || []).slice().sort(function(a,b){ return (b.monthlyVolume||0) - (a.monthlyVolume||0); });
-        var vol = ppl.reduce(function(s,p){ return s + (Number(p.monthlyVolume)||0); }, 0);
-        var band = e("div",{class:"fn-band",style:"--stage:" + (typeof stageColor === "function" ? stageColor(stg.id) : "var(--brand)")});
-        var head = e("div",{class:"fn-head",onClick:function(){ navigate("stage:" + stg.id); }},
-          e("span",{class:"fn-name"}, stg.label),
-          e("span",{class:"fn-count"}, String(ppl.length)),
-          vol ? e("span",{class:"fn-vol"}, "$" + Math.round(vol/1e6*10)/10 + "M/mo") : e("span",{class:"fn-vol"},""),
-          e("button",{class:"fn-open",onClick:function(ev){ ev.stopPropagation(); navigate("stage:" + stg.id); }},"Open \u2197")
-        );
-        band.appendChild(head);
-        if(ppl.length){
-          var strip = e("div",{class:"fn-strip"});
-          ppl.slice(0, 30).forEach(function(p){
-            var ini = ((p.firstName||"?").charAt(0) + (p.lastName||"").charAt(0)).toUpperCase();
-            strip.appendChild(e("div",{class:"fn-chip" + ((window.isWebinarLead && window.isWebinarLead(p)) ? " wl-pink" : ""),onClick:function(){ navigate("prospect:" + p.id); }},
-              e("span",{class:"av"}, ini),
-              e("span",{}, (p.firstName||"") + " " + (p.lastName||""))
-            ));
-          });
-          if(ppl.length > 30) strip.appendChild(e("span",{class:"fn-more"}, "+" + (ppl.length - 30) + " more \u2192"));
-          band.appendChild(strip);
-        } else {
-          band.appendChild(e("div",{class:"fn-empty"},"Empty"));
+      wrap.appendChild(bands);
+
+      function matches(p){
+        if(!q) return true;
+        return ((p.firstName||"") + " " + (p.lastName||"") + " " + (p.company||"") + " " +
+                (p.market||"") + " " + (p.position||"") + " " + (p.nmls||"")).toLowerCase().indexOf(q) !== -1;
+      }
+
+      function draw(){
+        bands.innerHTML = "";
+        var byStage = {};
+        (state.prospects || []).forEach(function(p){ if(!p) return; (byStage[p.stage] = byStage[p.stage] || []).push(p); });
+        var totalHits = 0;
+        getStages().forEach(function(stg){
+          if(window.isHoldingStage && window.isHoldingStage(stg.id)) return;  // held outside the pipeline
+          var all = (byStage[stg.id] || []);
+          var ppl = all.filter(matches).sort(function(a,b){ return (b.monthlyVolume||0) - (a.monthlyVolume||0); });
+          totalHits += ppl.length;
+          if(q && !ppl.length) return;                    // hide stages with no matches while searching
+          var vol = ppl.reduce(function(s,p){ return s + (Number(p.monthlyVolume)||0); }, 0);
+          var band = e("div",{class:"fn-band",style:"--stage:" + (typeof stageColor === "function" ? stageColor(stg.id) : "var(--brand)")});
+          var head = e("div",{class:"fn-head",onClick:function(){ navigate("stage:" + stg.id); }},
+            e("span",{class:"fn-name"}, stg.label),
+            e("span",{class:"fn-count"}, q ? (ppl.length + " of " + all.length) : String(ppl.length)),
+            vol ? e("span",{class:"fn-vol"}, "$" + Math.round(vol/1e6*10)/10 + "M/mo") : e("span",{class:"fn-vol"},""),
+            e("button",{class:"fn-open",onClick:function(ev){ ev.stopPropagation(); navigate("stage:" + stg.id); }},"Open \u2197")
+          );
+          band.appendChild(head);
+          if(ppl.length){
+            var strip = e("div",{class:"fn-strip"});
+            ppl.slice(0, 30).forEach(function(p){
+              var ini = ((p.firstName||"?").charAt(0) + (p.lastName||"").charAt(0)).toUpperCase();
+              strip.appendChild(e("div",{class:"fn-chip" + ((window.isWebinarLead && window.isWebinarLead(p)) ? " wl-pink" : ""),onClick:function(){ navigate("prospect:" + p.id); }},
+                e("span",{class:"av"}, ini),
+                e("span",{}, (p.firstName||"") + " " + (p.lastName||""))
+              ));
+            });
+            if(ppl.length > 30) strip.appendChild(e("span",{class:"fn-more"}, "+" + (ppl.length - 30) + " more \u2192"));
+            band.appendChild(strip);
+          } else {
+            band.appendChild(e("div",{class:"fn-empty"},"Empty"));
+          }
+          bands.appendChild(band);
+        });
+        if(q && !totalHits){
+          bands.appendChild(e("div",{class:"empty",style:"margin-top:16px"}, e("div",{class:"ic"},"\u00B7"), "Nobody matches \u201C" + q + "\u201D."));
         }
-        wrap.appendChild(band);
+      }
+
+      search.addEventListener("input", function(){
+        q = (search.value || "").toLowerCase().trim();
+        clear.style.display = q ? "" : "none";
+        draw();
       });
+      draw();
       return wrap;
     }
   }
@@ -29036,40 +29065,60 @@ if(params.get("u") && params.get("pin")){
   var TARGET = "awaiting-li-accept";
   var MOVE_FROM = ["engaging", "engaged"];   // ONLY these two move
 
+  var LS_FLAG = "pm_flow2_migrated_v2";
+
+  // Has this migration already happened, on this device or any other?
+  function alreadyDone(){
+    try{ if(localStorage.getItem(LS_FLAG)) return true; }catch(e){}
+    if(state && state.flow2Migration && state.flow2Migration.done) return true;
+    // Legacy receipts: if any prospect still carries a marker from a previous
+    // run, the migration has clearly already happened.
+    if(state && Array.isArray(state.prospects)){
+      for(var i = 0; i < state.prospects.length; i++){
+        var p = state.prospects[i];
+        if(p && (p._flow2v2 || p._flow2 || p._preFlow2Stage)) return true;
+      }
+    }
+    return false;
+  }
+
+  function markDone(moved){
+    try{ localStorage.setItem(LS_FLAG, String(Date.now())); }catch(e){}
+    state.flow2Migration = { done: Date.now(), moved: moved || 0 };
+  }
+
   function runBulkMigration(){
     try{
       if(!state || !state.user) return false;
       if(!getStages().some(function(s){ return s && s.id === TARGET; })) return false; // stages not ready yet
-      var moved = 0, reverted = 0, marked = 0;
+
+      // ONE TIME, EVER. If it has run before — on this device or any other —
+      // stop here. Re-running would drag manually-sorted prospects back into
+      // Awaiting LinkedIn Acceptance and wipe real progress.
+      if(alreadyDone()){
+        if(!state.flow2Migration || !state.flow2Migration.done){ markDone(0); persist(); }
+        return true;
+      }
+
+      var moved = 0;
       (state.prospects || []).forEach(function(p){
-        if(!p || p._flow2v2) return;     // already handled on some device — one time only
-        // Undo any earlier, broader sweep before deciding fresh.
-        if(p._preFlow2Stage){
-          p.stage = p._preFlow2Stage;
-          delete p._preFlow2Stage;
-          reverted++;
-        }
-        delete p._flow2;
-        p._flow2v2 = 1; marked++;
-        if(p.stagePinned) return;                      // pinned (e.g. webinar leads) never auto-move
-        if(MOVE_FROM.indexOf(p.stage) === -1) return;   // everyone else stays put
-        p._preFlow2Stage = p.stage;      // remembered so the move can be undone
+        if(!p || p.stagePinned) return;                 // pinned (webinar leads) never auto-move
+        if(MOVE_FROM.indexOf(p.stage) === -1) return;   // only Engaging / Engaged
+        p._preFlow2Stage = p.stage;                     // for the Undo button only
+        p._flow2v2 = 1;
         p.stage = TARGET;
         if(!Array.isArray(p.stagesSeen)) p.stagesSeen = [];
         if(p.stagesSeen.indexOf(TARGET) === -1) p.stagesSeen.push(TARGET);
         moved++;
       });
-      if(marked){
-        if(moved && typeof logActivity === "function"){
-          logActivity(null, "stage-change", "Flow 2.0 migration: moved " + moved + " Engaging/Engaged prospects to Awaiting LinkedIn Acceptance");
-        }
-        persist();
-        if(moved || reverted){
-          if(typeof showToast === "function"){
-            showToast("Moved " + moved + " Engaging/Engaged prospects to Awaiting LinkedIn Acceptance" + (reverted ? " (and undid the earlier broader move)" : ""));
-          }
-          if(typeof navigate === "function") navigate(state.screen, { replace:true });
-        }
+      markDone(moved);
+      if(moved && typeof logActivity === "function"){
+        logActivity(null, "stage-change", "Flow 2.0 migration: moved " + moved + " Engaging/Engaged prospects to Awaiting LinkedIn Acceptance");
+      }
+      persist();
+      if(moved){
+        if(typeof showToast === "function") showToast("Moved " + moved + " Engaging/Engaged prospects to Awaiting LinkedIn Acceptance");
+        if(typeof navigate === "function") navigate(state.screen, { replace:true });
       }
       return true;
     }catch(e){ console.error("flow2 bulk migration", e); return false; }
@@ -29082,6 +29131,9 @@ if(params.get("u") && params.get("pin")){
       if(p && p._preFlow2Stage){ p.stage = p._preFlow2Stage; delete p._preFlow2Stage; back++; }
       if(p){ delete p._flow2; delete p._flow2v2; }
     });
+    // Keep the receipt: undoing must NOT re-arm the migration.
+    try{ localStorage.setItem(LS_FLAG, String(Date.now())); }catch(e){}
+    state.flow2Migration = { done: Date.now(), moved: 0, undone: true };
     persist();
     if(typeof showToast === "function") showToast(back ? ("Reverted " + back + " prospects to their previous stages") : "Nothing to revert");
     if(typeof navigate === "function") navigate(state.screen, { replace:true });
@@ -29520,6 +29572,63 @@ if(params.get("u") && params.get("pin")){
   })();
 })();
 </script>
+
+<!-- ============================================================
+     RECRUIT OS — STRIP STALE LINKEDIN-CONNECT TASKS
+     The LinkedIn connection request now happens in the gated
+     stages BEFORE any cadence starts, so it was removed from the
+     cadence templates. But prospects whose cadence had already
+     been built still carry that task in their live chain, which
+     is why "Send LinkedIn connection request" kept showing up as
+     a due touch. This drops those PENDING tasks. Completed
+     history is never touched.
+     ============================================================ -->
+<script>
+(function(){
+  "use strict";
+  var RX = /connection request/i;
+
+  function strip(){
+    try{
+      if(!state || !state.user) return false;
+      var n = 0;
+      (state.prospects || []).forEach(function(p){
+        if(!p || !p.cadence || !Array.isArray(p.cadence.chain)) return;
+        var before = p.cadence.chain.length;
+        p.cadence.chain = p.cadence.chain.filter(function(tk){
+          if(!tk) return false;
+          // keep anything already done/skipped — that's history
+          if(tk.status === "done" || tk.doneAt || tk.status === "skipped") return true;
+          return !(RX.test(String(tk.action || "")) || RX.test(String(tk.short || "")));
+        });
+        if(p.cadence.chain.length !== before) n++;
+        // Re-activate the next pending task if stripping removed the active one.
+        if(p.cadence.chain.length){
+          var hasActive = p.cadence.chain.some(function(tk){ return tk && tk.status === "active"; });
+          if(!hasActive){
+            for(var i = 0; i < p.cadence.chain.length; i++){
+              var tk = p.cadence.chain[i];
+              if(tk && tk.status !== "done" && !tk.doneAt && tk.status !== "skipped"){ tk.status = "active"; break; }
+            }
+          }
+        }
+      });
+      if(n){
+        persist();
+        console.log("[flow2] removed stale LinkedIn-connect tasks from " + n + " cadence chain(s)");
+      }
+      return true;
+    }catch(e){ console.error("strip li-connect", e); return false; }
+  }
+
+  (function schedule(){
+    var tries = 0;
+    var iv = setInterval(function(){
+      tries++;
+      if(strip() || tries > 60) clearInterval(iv);
+    }, 950);
+  })();
+})();
+</script>
 </body>
 </html>
-
