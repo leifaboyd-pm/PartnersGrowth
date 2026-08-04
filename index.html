@@ -22889,7 +22889,10 @@ function viewReports(){
   const redSum    = reds.reduce((s,p) => s + getMonthlyVolume(p), 0);
   const totalPipeline = greenSum + yellowSum + redSum;
   const probableVolume = greenSum*PROBABILITY_WEIGHT.Green + yellowSum*PROBABILITY_WEIGHT.Yellow + redSum*PROBABILITY_WEIGHT.Red;
-  const hires = ps.filter(p => p.stage === STAGE_CLOSED && p.hireDate);
+  // A hire is a hire regardless of which track they came through — the main
+  // pipeline's Closed/Joined or the webinar pipeline's Closed.
+  const isHiredStage = st => st === STAGE_CLOSED || st === "webinar-closed";
+  const hires = ps.filter(p => isHiredStage(p.stage) && p.hireDate);
   const hiresYTD = hires.filter(h => new Date(h.hireDate).getFullYear() === year);
   const hiresMTD = hires.filter(h => h.hireDate >= monthStartTs);
   const loi = ps.filter(p => (p.loiOutDate || p.stage === STAGE_LOI) && p.stage !== STAGE_CLOSED).sort((a,b) => (b.loiOutDate||0) - (a.loiOutDate||0));
@@ -28142,14 +28145,14 @@ if(params.get("u") && params.get("pin")){
     if(!people.length){ if(typeof showToast === "function") showToast("No prospects in " + stageLabel + " to export"); return; }
     people = people.slice().sort(function(a,b){ return (b.monthlyVolume||0) - (a.monthlyVolume||0); });
 
-    _annualMode = (stageId === "closed" || /hire|hired|joined|closed/i.test(String(stageLabel || "")));
+    _annualMode = (stageId === "closed" || stageId === "webinar-closed" || /hire|hired|joined|closed/i.test(String(stageLabel || "")));
     var totalVol = people.reduce(function(s,p){ var d = volDollars(p); return s + (d ? d.v : 0); }, 0);
     var m = stageMetrics(stageId);
     // Company convention: hires are quoted ANNUALLY (e.g. "10M / yr"),
     // active pipeline is quoted monthly. Label accordingly.
     // Hires are annual. Recognize the hires column by id OR label so a
     // recreated/renamed column ("Hired", "Closed / Joined", etc.) still counts.
-    var isHires = stageId === "closed" || /hire|hired|joined|closed/i.test(String(stageLabel || ""));
+    var isHires = stageId === "closed" || stageId === "webinar-closed" || /hire|hired|joined|closed/i.test(String(stageLabel || ""));
     var volLabel = isHires ? "Annual volume" : "Monthly volume";
     var volTh = isHires ? "Annual volume" : "Mo. volume";
     var today = new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"});
@@ -28327,7 +28330,7 @@ if(params.get("u") && params.get("pin")){
 <script>
 (function(){
   "use strict";
-  window.__ROS_BUILD = "Build 2026-07-29V \u2014 migration runs once + funnel search";
+  window.__ROS_BUILD = "Build 2026-07-30Y \u2014 webinar hires count in reports";
   try { console.log("[RecruitOS] " + window.__ROS_BUILD); } catch(e){}
   if(typeof window.viewSettings === "function"){
     var _vs = window.viewSettings;
@@ -28418,6 +28421,27 @@ if(params.get("u") && params.get("pin")){
      stage pages, and the research-driven first-text composer.
      ============================================================ -->
 <style>
+  /* pipeline header toolbar — one row, matched heights */
+  .pipe-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+  .pipe-search{height:34px;padding:0 12px;border:1px solid var(--line);border-radius:9px;
+    background:var(--surface);font-size:13px;color:var(--t-1);width:210px;min-width:150px;font-family:inherit}
+  .pipe-search:focus{outline:none;border-color:var(--brand);box-shadow:0 0 0 3px var(--brand-soft,rgba(0,129,139,.12))}
+  .pipe-btn{height:34px;display:inline-flex;align-items:center;gap:6px;padding:0 13px;border:1px solid var(--line);
+    border-radius:9px;background:var(--surface);font-size:12.5px;font-weight:600;color:var(--t-2);
+    cursor:pointer;white-space:nowrap;font-family:inherit;transition:border-color .15s,color .15s,background .15s}
+  .pipe-btn:hover{border-color:var(--brand);color:var(--brand)}
+  .pipe-btn.wl{background:#d946ef;border-color:#d946ef;color:#fff}
+  .pipe-btn.wl:hover{background:#c026d3;border-color:#c026d3;color:#fff}
+  .pipe-seg{display:inline-flex;height:34px;border:1px solid var(--line);border-radius:9px;overflow:hidden;flex:0 0 auto}
+  .pipe-seg button{height:100%;padding:0 15px;border:0;background:var(--surface);font-size:12.5px;font-weight:600;
+    color:var(--t-2);cursor:pointer;font-family:inherit;transition:background .15s,color .15s}
+  .pipe-seg button + button{border-left:1px solid var(--line)}
+  .pipe-seg button:hover:not(.on){background:var(--surface-2);color:var(--t-1)}
+  .pipe-seg button.on{background:var(--brand);color:#fff}
+  @media(max-width:640px){
+    .pipe-toolbar{width:100%;justify-content:stretch}
+    .pipe-search{flex:1 1 100%;width:auto;order:-1}
+  }
   /* funnel view */
   .fn-band{border:1px solid var(--line);border-radius:14px;background:var(--surface);margin-bottom:10px;overflow:hidden;box-shadow:var(--shadow)}
   .fn-head{display:flex;align-items:center;gap:10px;padding:11px 14px;border-left:5px solid var(--stage,var(--brand));cursor:pointer}
@@ -28650,27 +28674,45 @@ if(params.get("u") && params.get("pin")){
       if(mode === "board") return boardWithToggle();
       return funnelView();
     };
-    function toggleBtn(cur){
-      return e("div",{style:"display:flex;gap:6px"},
-        e("button",{class:"btn sm" + (cur==="funnel"?"":" subtle"),onClick:function(){ try{localStorage.setItem(VIEW_KEY,"funnel");}catch(e){} navigate(state.screen,{replace:true}); }},"Funnel"),
-        e("button",{class:"btn sm" + (cur==="board"?"":" subtle"),onClick:function(){ try{localStorage.setItem(VIEW_KEY,"board");}catch(e){} navigate(state.screen,{replace:true}); }},"Board")
+    function segToggle(cur){
+      function go(mode){ try{ localStorage.setItem(VIEW_KEY, mode); }catch(e){} navigate(state.screen, { replace:true }); }
+      return e("div",{class:"pipe-seg"},
+        e("button",{class:(cur==="funnel"?"on":""),onClick:function(){ go("funnel"); }},"Funnel"),
+        e("button",{class:(cur==="board"?"on":""),onClick:function(){ go("board"); }},"Board")
       );
+    }
+    // One toolbar for both views so the controls always match.
+    function pipelineToolbar(cur, searchEl){
+      var bar = e("div",{class:"pipe-toolbar"});
+      if(searchEl) bar.appendChild(searchEl);
+      try{
+        var n = (state.prospects || []).filter(function(p){
+          return p && window.isHoldingStage && window.isHoldingStage(p.stage);
+        }).length;
+        bar.appendChild(e("button",{class:"pipe-btn wl",onClick:function(){ navigate("webinar"); }},
+          "Webinar Leads" + (n ? " (" + n + ")" : "")));
+      }catch(e){}
+      bar.appendChild(segToggle(cur));
+      return bar;
     }
     function boardWithToggle(){
       var v = _board.apply(this, arguments);
-      try{ v.insertBefore(e("div",{style:"display:flex;justify-content:flex-end;margin-bottom:8px"}, toggleBtn("board")), v.firstChild); }catch(e){}
+      try{
+        var acts = v.querySelector(".h-section .actions");
+        if(acts){ acts.innerHTML = ""; acts.appendChild(pipelineToolbar("board", null)); }
+        else v.insertBefore(e("div",{style:"display:flex;justify-content:flex-end;margin-bottom:10px"}, pipelineToolbar("board", null)), v.firstChild);
+      }catch(e){}
       return v;
     }
     function funnelView(){
       var wrap = e("div",{class:"screen"});
       var q = "";
       var bands = e("div",{});
-      var search = e("input",{type:"search", placeholder:"Search anyone in the pipeline\u2026", style:"max-width:280px"});
-      var clear = e("button",{class:"btn sm subtle",style:"display:none",onClick:function(){ search.value=""; q=""; clear.style.display="none"; draw(); }},"Clear");
+      var search = e("input",{type:"search", class:"pipe-search", placeholder:"Search the pipeline\u2026"});
 
       wrap.appendChild(e("div",{class:"h-section"},
         e("div",{}, e("h2",{},"Pipeline"), e("div",{class:"sub"},"Tap a stage to open it full screen")),
-        e("div",{class:"actions",style:"display:flex;gap:8px;align-items:center;flex-wrap:wrap"}, search, clear, toggleBtn("funnel"))
+        e("div",{class:"actions"}, pipelineToolbar("funnel", search))
       ));
       wrap.appendChild(bands);
 
@@ -28723,7 +28765,6 @@ if(params.get("u") && params.get("pin")){
 
       search.addEventListener("input", function(){
         q = (search.value || "").toLowerCase().trim();
-        clear.style.display = q ? "" : "none";
         draw();
       });
       draw();
@@ -29192,80 +29233,103 @@ if(params.get("u") && params.get("pin")){
   .wl-tag{font-size:10.5px;padding:2px 7px;border-radius:999px;border:1px solid var(--line);color:var(--t-3);white-space:nowrap}
   .wl-tag.ok{color:#15803d;border-color:rgba(21,128,61,.35);background:rgba(21,128,61,.07)}
   .wl-tag.wait{color:#a16207;border-color:rgba(161,98,7,.35);background:rgba(161,98,7,.07)}
-  .wl-acts{display:flex;gap:6px;flex-wrap:wrap;flex:0 0 auto}
+  .wl-acts{display:flex;gap:6px;flex-wrap:wrap;flex:0 0 auto;align-items:center}
+  .wl-move{height:30px;padding:0 8px;border:1px solid var(--line);border-radius:8px;background:var(--surface);
+    font-size:12px;font-family:inherit;color:var(--t-2);cursor:pointer;max-width:190px}
+  .wl-move:hover{border-color:#d946ef;color:#a21caf}
+  .wl-move:focus{outline:none;border-color:#d946ef}
   @media(max-width:640px){ .wl-row{flex-wrap:wrap} .wl-acts{width:100%} }
 </style>
 <script>
 (function(){
   "use strict";
 
-  // Stages held OUTSIDE the pipeline (not shown as funnel bands / board columns).
+  // The webinar pipeline is a SEPARATE track. Every stage id is prefixed
+  // "webinar-" so it can never be confused with the main pipeline, and all of
+  // them are held outside the main funnel/board/Work Now.
+  var WEBINAR_STAGES = [
+    { id:"webinar-leads",   label:"New Webinar Lead", color:"#d946ef" },
+    { id:"webinar-engaged", label:"Engaged",          color:"#c026d3" },
+    { id:"webinar-loi",     label:"LOI Out",          color:"#a21caf" },
+    { id:"webinar-closed",  label:"Closed",           color:"#86198f" }
+  ];
+  window.WEBINAR_STAGES = WEBINAR_STAGES;
+
   window.isHoldingStage = function(id){
     if(!id) return false;
-    if(id === "webinar-leads") return true;
+    if(/^webinar-/.test(String(id))) return true;          // the whole webinar track
     var st = (typeof getStages === "function" ? getStages() : (state.stages || []))
               .find(function(s){ return s && s.id === id; });
-    return !!(st && /webinar/i.test(String(st.label || "")));
+    return !!(st && /webinar/i.test(String(st.label || "")));   // legacy columns
   };
 
-  // Find (or create) the Webinar Leads holding list. Matched by LABEL so a
-  // recreated/renamed column still resolves.
-  function webinarStageId(createIfMissing){
-    var stages = (typeof getStages === "function") ? getStages() : (state.stages || []);
-    var hit = stages.find(function(s){ return s && /webinar/i.test(String(s.label || "")); });
-    if(hit) return hit.id;
-    if(!createIfMissing) return null;
-    var id = "webinar-leads";
-    var list = Array.isArray(state.stages) && state.stages.length ? state.stages.slice() : stages.slice();
-    if(!list.some(function(s){ return s && s.id === id; })){
-      var at = list.findIndex(function(s){ return s && s.id === "new"; });
-      var entry = { id:id, label:"Webinar Leads" };
-      if(at === -1) list.unshift(entry); else list.splice(at + 1, 0, entry);
-      state.stages = list;
-      persist();
+  // Make sure all four webinar stages exist (so nothing gets orphan-rescued
+  // into the main pipeline) and sit together right after New Prospect.
+  function ensureWebinarStages(){
+    var list = Array.isArray(state.stages) && state.stages.length
+      ? state.stages.slice()
+      : ((typeof getStages === "function" ? getStages() : []) || []).slice();
+    var changed = false;
+    // Adopt any legacy webinar column as the first webinar stage.
+    var legacy = list.find(function(s){ return s && /webinar/i.test(String(s.label||"")) && !/^webinar-/.test(s.id); });
+    if(legacy){
+      (state.prospects || []).forEach(function(p){ if(p && p.stage === legacy.id) p.stage = "webinar-leads"; });
+      list = list.filter(function(s){ return s !== legacy; });
+      changed = true;
     }
-    return id;
+    var at = list.findIndex(function(s){ return s && s.id === "new"; });
+    var insertAt = (at === -1 ? 0 : at + 1);
+    WEBINAR_STAGES.forEach(function(ws, i){
+      var existing = list.find(function(s){ return s && s.id === ws.id; });
+      if(existing){
+        if(existing.label !== ws.label){ existing.label = ws.label; changed = true; }
+      } else {
+        list.splice(insertAt + i, 0, { id:ws.id, label:ws.label });
+        changed = true;
+      }
+    });
+    if(changed){ state.stages = list; persist(); }
+    return "webinar-leads";
   }
-  window.webinarStageId = webinarStageId;
-  try{ STAGE_COLORS["webinar-leads"] = "#d946ef"; }catch(e){}
+  window.webinarStageId = function(){ return ensureWebinarStages(); };
+
+  try{ WEBINAR_STAGES.forEach(function(ws){ STAGE_COLORS[ws.id] = ws.color; }); }catch(e){}
 
   function webinarLeads(){
-    var sid = webinarStageId(false);
-    if(!sid) return [];
-    return (state.prospects || []).filter(function(p){ return p && p.stage === sid; });
+    return (state.prospects || []).filter(function(p){ return p && window.isHoldingStage(p.stage); });
   }
 
   window.addWebinarLead = function(){
     openProspectModal(null, {
-      defaultStage: webinarStageId(true),
+      defaultStage: ensureWebinarStages(),
       source: "Webinar",
       title: "Add webinar lead",
       pin: true
     });
   };
 
-  // Move a lead OUT of the holding area and into the live pipeline.
+  // Move OUT of the webinar track and into the main pipeline.
   window.promoteWebinarLead = function(p, stageId){
-    p.stagePinned = false;                   // hand them to the normal flow
+    p.stagePinned = false;
     p.stage = stageId || "new";
     p.stageEnteredAt = Date.now();
     if(!Array.isArray(p.stagesSeen)) p.stagesSeen = [];
     if(p.stagesSeen.indexOf(p.stage) === -1) p.stagesSeen.push(p.stage);
-    if(typeof logActivity === "function") logActivity(p.id, "stage-change", "Webinar Leads \u2192 " + getStageLabel(p.stage));
+    if(typeof logActivity === "function") logActivity(p.id, "stage-change", "Webinar track \u2192 " + getStageLabel(p.stage));
     persist();
-    if(typeof showToast === "function") showToast((p.firstName||"") + " added to the pipeline");
+    if(typeof showToast === "function") showToast((p.firstName||"") + " moved to the main pipeline");
     if(typeof navigate === "function") navigate(state.screen, { replace:true });
   };
 
   function promotePicker(p){
-    showModal("Add to pipeline \u2014 " + (p.firstName||"") + " " + (p.lastName||""), function(modal, close){
+    showModal("Move to main pipeline \u2014 " + (p.firstName||"") + " " + (p.lastName||""), function(modal, close){
       modal.appendChild(e("p",{class:"muted",style:"font-size:13px;line-height:1.55;margin:0 0 12px"},
-        "Pick where they enter. New Prospect starts them at the top of the flow; research is already done, so they'll move to Waiting for First Text on their own."));
+        "This takes them out of the webinar track and into the main recruiting pipeline."));
       var sel = e("select",{});
-      getStages().forEach(function(s){
-        if(window.isHoldingStage(s.id)) return;
-        var o = e("option",{value:s.id}, s.label);
-        if(s.id === "new") o.selected = true;
+      getStages().forEach(function(st){
+        if(window.isHoldingStage(st.id)) return;
+        var o = e("option",{value:st.id}, st.label);
+        if(st.id === "new") o.selected = true;
         sel.appendChild(o);
       });
       modal.appendChild(sel);
@@ -29273,69 +29337,130 @@ if(params.get("u") && params.get("pin")){
         e("button",{class:"btn ghost",onClick:close},"Cancel"),
         e("button",{class:"btn",style:"background:var(--brand);color:#fff",onClick:function(){
           close(); window.promoteWebinarLead(p, sel.value);
-        }},"Add to pipeline")
+        }},"Move to pipeline")
       ));
     });
   }
 
+  // Move WITHIN the webinar track.
+  function moveWithinWebinar(p, stageId){
+    p.stage = stageId;
+    p.stageEnteredAt = Date.now();
+    // Same report stamping as the main pipeline, so webinar hires show up in
+    // the hires report and webinar LOIs carry a date.
+    if(stageId === "webinar-closed" && !p.hireDate) p.hireDate = Date.now();
+    if(stageId === "webinar-loi" && !p.loiOutDate) p.loiOutDate = Date.now();
+    p.stagePinned = true;                       // stays immune to main-pipeline automation
+    if(!Array.isArray(p.stagesSeen)) p.stagesSeen = [];
+    if(p.stagesSeen.indexOf(stageId) === -1) p.stagesSeen.push(stageId);
+    if(typeof logActivity === "function") logActivity(p.id, "stage-change", "Webinar: \u2192 " + getStageLabel(stageId));
+    persist();
+    if(typeof navigate === "function") navigate(state.screen, { replace:true });
+  }
+
   window.viewWebinarLeads = function(){
+    ensureWebinarStages();
     var wrap = e("div",{class:"screen"});
-    var list = webinarLeads().slice().sort(function(a,b){ return (b.createdAt||0) - (a.createdAt||0); });
+    var all = webinarLeads();
+    var q = "";
+    var bands = e("div",{});
+    var search = e("input",{type:"search", class:"pipe-search", placeholder:"Search webinar leads\u2026"});
+
     wrap.appendChild(e("div",{class:"h-section"},
       e("div",{},
         e("h2",{},"Webinar Leads"),
-        e("div",{class:"sub"}, list.length + " lead" + (list.length===1?"":"s") + " held outside the pipeline")
+        e("div",{class:"sub"}, all.length + " lead" + (all.length===1?"":"s") + " \u00B7 separate from the main pipeline")
       ),
       e("div",{class:"actions"},
-        e("button",{class:"btn sm",style:"background:#d946ef;color:#fff;border-color:#d946ef",onClick:function(){ window.addWebinarLead(); }}, "+ Add webinar lead"),
-        e("button",{class:"btn sm subtle",onClick:function(){ navigate("prospects"); }}, "\u2190 Pipeline")
+        e("div",{class:"pipe-toolbar"},
+          search,
+          e("button",{class:"pipe-btn wl",onClick:function(){ window.addWebinarLead(); }}, "+ Add lead"),
+          e("button",{class:"pipe-btn",onClick:function(){ navigate("prospects"); }}, "\u2190 Main pipeline")
+        )
       )
     ));
-    wrap.appendChild(e("p",{class:"muted",style:"font-size:12.5px;line-height:1.55;margin:0 0 14px"},
-      "These sit here untouched \u2014 research runs automatically, but nothing moves them. Add them to the pipeline whenever you're ready."));
+    wrap.appendChild(bands);
 
-    if(!list.length){
-      wrap.appendChild(e("div",{class:"empty"}, e("div",{class:"ic"},"\u00B7"), "No webinar leads yet."));
-      return wrap;
+    function matches(p){
+      if(!q) return true;
+      return ((p.firstName||"") + " " + (p.lastName||"") + " " + (p.company||"") + " " + (p.market||"")).toLowerCase().indexOf(q) !== -1;
     }
-    list.forEach(function(p){
+
+    function row(p){
       var researched = !!(p.research && !p.research.error);
       var ini = ((p.firstName||"?").charAt(0) + (p.lastName||"").charAt(0)).toUpperCase();
-      var row = e("div",{class:"wl-row"});
-      row.appendChild(e("div",{class:"wl-av"}, ini));
-      row.appendChild(e("div",{class:"wl-main",style:"cursor:pointer",onClick:function(){ navigate("prospect:"+p.id); }},
+      var r = e("div",{class:"wl-row"});
+      r.appendChild(e("div",{class:"wl-av"}, ini));
+      r.appendChild(e("div",{class:"wl-main",style:"cursor:pointer",onClick:function(){ navigate("prospect:"+p.id); }},
         e("div",{class:"wl-name"}, (p.firstName||"") + " " + (p.lastName||"")),
         e("div",{class:"wl-sub"}, [p.company, p.market, p.linkedin ? "LinkedIn \u2713" : null].filter(Boolean).join(" \u00B7 ") || "\u2014")
       ));
-      row.appendChild(e("span",{class:"wl-tag " + (researched ? "ok" : "wait")}, researched ? "Researched" : "Research pending"));
+      r.appendChild(e("span",{class:"wl-tag " + (researched ? "ok" : "wait")}, researched ? "Researched" : "Research pending"));
       var acts = e("div",{class:"wl-acts"});
+      var mover = e("select",{class:"wl-move",onChange:function(ev){
+        var v = ev.target.value;
+        if(v === "__main"){ ev.target.value = p.stage; promotePicker(p); return; }
+        if(v !== p.stage) moveWithinWebinar(p, v);
+      }});
+      WEBINAR_STAGES.forEach(function(ws){
+        var o = e("option",{value:ws.id}, ws.label);
+        if(p.stage === ws.id) o.selected = true;
+        mover.appendChild(o);
+      });
+      mover.appendChild(e("option",{value:"__main"}, "\u2192 Move to main pipeline\u2026"));
+      acts.appendChild(mover);
       if(!researched){
         acts.appendChild(e("button",{class:"btn sm subtle",onClick:function(){ if(typeof runResearch === "function") runResearch(p); }}, "\u21BB Research"));
       }
-      acts.appendChild(e("button",{class:"btn sm",style:"background:var(--brand);color:#fff",onClick:function(){ promotePicker(p); }}, "\u2192 Add to pipeline"));
-      row.appendChild(acts);
-      wrap.appendChild(row);
-    });
+      r.appendChild(acts);
+      return r;
+    }
+
+    function draw(){
+      bands.innerHTML = "";
+      var hits = 0;
+      WEBINAR_STAGES.forEach(function(ws){
+        var inStage = all.filter(function(p){ return p.stage === ws.id; });
+        var ppl = inStage.filter(matches);
+        hits += ppl.length;
+        if(q && !ppl.length) return;
+        var band = e("div",{class:"fn-band",style:"--stage:" + ws.color});
+        band.appendChild(e("div",{class:"fn-head",style:"cursor:default"},
+          e("span",{class:"fn-name"}, ws.label),
+          e("span",{class:"fn-count"}, q ? (ppl.length + " of " + inStage.length) : String(ppl.length))
+        ));
+        if(ppl.length){
+          var body = e("div",{style:"padding:0 12px 12px"});
+          ppl.forEach(function(p){ body.appendChild(row(p)); });
+          band.appendChild(body);
+        } else {
+          band.appendChild(e("div",{class:"fn-empty"},"Empty"));
+        }
+        bands.appendChild(band);
+      });
+      if(q && !hits){
+        bands.appendChild(e("div",{class:"empty",style:"margin-top:16px"}, e("div",{class:"ic"},"\u00B7"), "Nobody matches \u201C" + q + "\u201D."));
+      }
+      if(!all.length){
+        bands.innerHTML = "";
+        bands.appendChild(e("div",{class:"empty"}, e("div",{class:"ic"},"\u00B7"), "No webinar leads yet."));
+      }
+    }
+    search.addEventListener("input", function(){ q = (search.value||"").toLowerCase().trim(); draw(); });
+    draw();
     return wrap;
   };
 
   // Entry button (with live count) on the pipeline and dashboard headers.
   function navBtn(){
-    var n = webinarLeads().length;
+    var n = (state.prospects || []).filter(function(p){ return p && window.isHoldingStage(p.stage); }).length;
     return e("button",{class:"btn sm",style:"background:#d946ef;color:#fff;border-color:#d946ef",
       onClick:function(){ navigate("webinar"); }}, "Webinar Leads" + (n ? " (" + n + ")" : ""));
   }
-  if(typeof window.viewProspects === "function"){
-    var _vp = window.viewProspects;
-    window.viewProspects = function(){
-      var v = _vp.apply(this, arguments);
-      try{
-        var acts = v.querySelector(".h-section .actions") || v.querySelector(".h-section > div:last-child");
-        if(acts) acts.insertBefore(navBtn(), acts.firstChild);
-      }catch(e){ console.error("webinar nav btn", e); }
-      return v;
-    };
-  }
+  // NOTE: the pipeline header builds its own toolbar (search + this button +
+  // the Funnel/Board switch) so the controls line up. Only the dashboard gets
+  // an injected button.
+  window.webinarNavButton = navBtn;
   if(typeof window.viewDashboard === "function"){
     var _vd = window.viewDashboard;
     window.viewDashboard = function(){
@@ -29356,14 +29481,12 @@ if(params.get("u") && params.get("pin")){
       try{
         if(state && state.user){
           clearInterval(iv);
-          var sid = webinarStageId(false);
-          if(sid){
-            var n = 0;
-            (state.prospects || []).forEach(function(p){
-              if(p && p.stage === sid && !p.stagePinned){ p.stagePinned = true; n++; }
-            });
-            if(n) persist();
-          }
+          ensureWebinarStages();
+          var n = 0;
+          (state.prospects || []).forEach(function(p){
+            if(p && window.isHoldingStage(p.stage) && !p.stagePinned){ p.stagePinned = true; n++; }
+          });
+          if(n) persist();
         } else if(tries > 60){ clearInterval(iv); }
       }catch(e){ clearInterval(iv); }
     }, 700);
