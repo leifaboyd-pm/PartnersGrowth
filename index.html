@@ -15856,6 +15856,9 @@ async function syncFromCloudOnBoot(){
     state.expiredActs = Array.from(new Set((state.expiredActs || []).concat(cloud.expiredActs))).slice(-1000);
   }
   if(cloud.flow2Migration && !state.flow2Migration) state.flow2Migration = cloud.flow2Migration;
+  if(Array.isArray(cloud.dupeDismissed) && cloud.dupeDismissed.length){
+    state.dupeDismissed = Array.from(new Set((state.dupeDismissed || []).concat(cloud.dupeDismissed))).slice(-500);
+  }
   const bootMerged = (typeof window.__rosMerge === "function")
     ? window.__rosMerge(state.prospects || [], cloud.prospects || [], state.deletedIds || [], cloud.deletedIds || [], cloudTime > localTime)
     : null;
@@ -17388,7 +17391,8 @@ function viewProspectDetail(p){
 
   // Tabs
   const tabs = e("div",{class:"pd-tabs"});
-  const TABS = ["Playbook","Research","Text generation","Overview","Activity","Notes","Files"];
+  // Files tab removed — attachments live in the Notes tab (same storage).
+  const TABS = ["Playbook","Research","Text generation","Overview","Activity","Notes"];
   // Tab choice is LOCAL UI state — kept off the synced record so a cloud
   // merge replacing this prospect can't yank the user back to Playbook.
   window._pdTabs = window._pdTabs || {};
@@ -17410,7 +17414,7 @@ function viewProspectDetail(p){
   if(activeTab === "Overview")  wrap.appendChild(pdOverview(p));
   if(activeTab === "Activity")  wrap.appendChild(pdActivity(p));
   if(activeTab === "Notes")     wrap.appendChild(pdNotes(p));
-  if(activeTab === "Files")     wrap.appendChild(pdFiles(p));
+  if(activeTab === "Files")     { window._pdTabs = window._pdTabs || {}; window._pdTabs[p.id] = "Notes"; wrap.appendChild(pdNotes(p)); } // legacy deep-links land on Notes
 
   return wrap;
 }
@@ -18069,18 +18073,85 @@ function textArea(p, key, placeholder){
 }
 function pdNotes(p){
   const wrap = e("div",{class:"screen"});
-  wrap.appendChild(e("div",{class:"pd-section"},
-    e("div",{class:"card"},
-      e("label",{style:"font-size:12px;color:var(--t-2);display:block;margin-bottom:6px"},"Notes"),
-      (function(){
-        const ta = e("textarea",{rows:8,placeholder:"Conversation notes, context, anything you'll want to remember…"});
-        ta.value = p.notes || "";
-        if(state.user.role === "viewer") ta.disabled = true;
-        ta.addEventListener("blur", ()=>{ if(p.notes !== ta.value){ p.notes = ta.value; logActivity(p.id,"note","Note updated"); persist(); showToast("Saved"); }});
-        return ta;
-      })()
-    )
-  ));
+  // Timestamped note log. Write a note, press Save, and it's recorded with the
+  // exact date and time so the history of this relationship is always readable.
+  if(!Array.isArray(p.noteLog)) p.noteLog = [];
+  // One-time: carry any pre-existing free-text note into the log so nothing is lost.
+  if(p.notes && String(p.notes).trim() && !p.noteLog.some(n => n && n.legacy)){
+    p.noteLog.push({
+      id: "n_" + uid(),
+      at: p.createdAt || Date.now(),
+      by: "",
+      legacy: true,
+      text: String(p.notes).trim()
+    });
+    persist();
+  }
+
+  const isViewerN = state.user.role === "viewer";
+  const composer = e("div",{class:"card"});
+  composer.appendChild(e("label",{style:"font-size:12px;color:var(--t-2);display:block;margin-bottom:6px"},"Add a note"));
+  const ta = e("textarea",{rows:4,placeholder:"What happened? Who said what? Anything you'll want to remember…"});
+  if(isViewerN) ta.disabled = true;
+  composer.appendChild(ta);
+  const bar = e("div",{style:"display:flex;align-items:center;gap:8px;margin-top:8px"});
+  const hint = e("span",{class:"muted",style:"font-size:11.5px"});
+  if(!isViewerN){
+    const saveBtn = e("button",{class:"btn sm",style:"background:var(--brand);color:#fff",onClick:()=>{
+      const txt = (ta.value || "").trim();
+      if(!txt){ showToast("Nothing to save"); return; }
+      p.noteLog = p.noteLog || [];
+      p.noteLog.push({
+        id: "n_" + uid(),
+        at: Date.now(),
+        by: (state.user && state.user.name) || "",
+        text: txt.slice(0, 4000)
+      });
+      if(p.noteLog.length > 200) p.noteLog = p.noteLog.slice(-200);
+      logActivity(p.id, "note", "Note: " + txt.slice(0, 120));
+      persist();
+      ta.value = "";
+      showToast("Note saved");
+      navigate(state.screen, { replace:true });
+    }}, "Save note");
+    bar.appendChild(saveBtn);
+    hint.textContent = "Saved with today's date and time.";
+  }
+  bar.appendChild(hint);
+  composer.appendChild(bar);
+  wrap.appendChild(e("div",{class:"pd-section"}, composer));
+
+  // History — newest first.
+  const hist = e("div",{class:"card",style:"margin-top:12px"});
+  hist.appendChild(e("label",{style:"font-size:12px;color:var(--t-2);display:block;margin-bottom:8px"},
+    "Note history" + (p.noteLog.length ? " (" + p.noteLog.length + ")" : "")));
+  if(!p.noteLog.length){
+    hist.appendChild(e("div",{class:"muted",style:"font-size:12.5px;font-style:italic"},"No notes yet."));
+  } else {
+    p.noteLog.slice().sort((a,b) => (b.at||0) - (a.at||0)).forEach(n => {
+      const when = new Date(n.at || 0);
+      const stamp = when.toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"})
+        + " \u00B7 " + when.toLocaleTimeString("en-US",{hour:"numeric",minute:"2-digit"});
+      const row = e("div",{class:"note-entry"});
+      const head = e("div",{class:"note-meta"},
+        e("span",{class:"note-when"}, stamp),
+        n.by ? e("span",{class:"note-by"}, n.by) : null,
+        n.legacy ? e("span",{class:"note-by"}, "earlier note") : null
+      );
+      if(!isViewerN){
+        head.appendChild(e("button",{class:"note-del",title:"Delete this note",onClick:()=>{
+          uiConfirm("Delete this note? This can't be undone.", ()=>{
+            p.noteLog = (p.noteLog || []).filter(x => x && x.id !== n.id);
+            persist(); showToast("Note deleted"); navigate(state.screen,{replace:true});
+          }, { title:"Delete note", okLabel:"Delete" });
+        }}, "\u00D7"));
+      }
+      row.appendChild(head);
+      row.appendChild(e("div",{class:"note-text"}, n.text || ""));
+      hist.appendChild(row);
+    });
+  }
+  wrap.appendChild(e("div",{class:"pd-section"}, hist));
   // Attachments — same storage as the Files tab (p.files), surfaced here so
   // supporting documents (PDF, Word, etc.) live right next to the notes.
   if(!p.files) p.files = [];
@@ -25478,6 +25549,9 @@ if(params.get("u") && params.get("pin")){
       state.expiredActs = Array.from(new Set((state.expiredActs || []).concat(cloud.expiredActs))).slice(-1000);
     }
     if(cloud.flow2Migration && !state.flow2Migration) state.flow2Migration = cloud.flow2Migration;
+    if(Array.isArray(cloud.dupeDismissed) && cloud.dupeDismissed.length){
+      state.dupeDismissed = Array.from(new Set((state.dupeDismissed || []).concat(cloud.dupeDismissed))).slice(-500);
+    }
     var merged = (typeof window.__rosMerge === "function")
       ? window.__rosMerge(state.prospects || [], incoming, state.deletedIds || [], cloud.deletedIds || [], newer)
       : null;
@@ -27852,6 +27926,7 @@ if(params.get("u") && params.get("pin")){
       out.deletedIds = (state.deletedIds || []).slice(-500); // cap growth
       out.expiredActs = (state.expiredActs || []).slice(-1000); // prospects whose activity history has expired
       if(state.flow2Migration) out.flow2Migration = state.flow2Migration; // one-time migration receipt
+      out.dupeDismissed = (state.dupeDismissed || []).slice(-500); // pairs marked "not a duplicate"
       return out;
     };
   }
@@ -27920,6 +27995,14 @@ if(params.get("u") && params.get("pin")){
       if(Array.isArray(l.stagesSeen)){
         if(!Array.isArray(w.stagesSeen)) w.stagesSeen = [];
         l.stagesSeen.forEach(function(s){ if(w.stagesSeen.indexOf(s) === -1) w.stagesSeen.push(s); });
+      }
+      // Note entries union by id — notes written on two devices both survive.
+      if(Array.isArray(l.noteLog) && l.noteLog.length){
+        if(!Array.isArray(w.noteLog)) w.noteLog = [];
+        l.noteLog.forEach(function(n){
+          if(n && n.id && !w.noteLog.some(function(x){ return x && x.id === n.id; })) w.noteLog.push(n);
+        });
+        if(w.noteLog.length > 200) w.noteLog = w.noteLog.slice(-200);
       }
       // Attachments union by url — files uploaded on two devices both survive.
       if(Array.isArray(l.files) && l.files.length){
@@ -28330,7 +28413,7 @@ if(params.get("u") && params.get("pin")){
 <script>
 (function(){
   "use strict";
-  window.__ROS_BUILD = "Build 2026-07-30Y \u2014 webinar hires count in reports";
+  window.__ROS_BUILD = "Build 2026-07-30AD \u2014 motion & polish layer";
   try { console.log("[RecruitOS] " + window.__ROS_BUILD); } catch(e){}
   if(typeof window.viewSettings === "function"){
     var _vs = window.viewSettings;
@@ -29238,6 +29321,16 @@ if(params.get("u") && params.get("pin")){
     font-size:12px;font-family:inherit;color:var(--t-2);cursor:pointer;max-width:190px}
   .wl-move:hover{border-color:#d946ef;color:#a21caf}
   .wl-move:focus{outline:none;border-color:#d946ef}
+  /* timestamped note entries */
+  .note-entry{padding:10px 0;border-bottom:1px solid var(--line)}
+  .note-entry:last-child{border-bottom:0;padding-bottom:0}
+  .note-meta{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+  .note-when{font-size:11.5px;font-weight:700;color:var(--brand);font-variant-numeric:tabular-nums}
+  .note-by{font-size:11px;color:var(--t-3);background:var(--surface-2);border-radius:999px;padding:1px 8px}
+  .note-del{margin-left:auto;border:0;background:none;color:var(--t-3);font-size:15px;line-height:1;
+    cursor:pointer;padding:0 4px;border-radius:6px}
+  .note-del:hover{color:var(--bad,#c62828);background:rgba(198,40,40,.08)}
+  .note-text{font-size:13.5px;line-height:1.55;color:var(--t-1);white-space:pre-wrap;word-break:break-word}
   @media(max-width:640px){ .wl-row{flex-wrap:wrap} .wl-acts{width:100%} }
 </style>
 <script>
@@ -29251,7 +29344,8 @@ if(params.get("u") && params.get("pin")){
     { id:"webinar-leads",   label:"New Webinar Lead", color:"#d946ef" },
     { id:"webinar-engaged", label:"Engaged",          color:"#c026d3" },
     { id:"webinar-loi",     label:"LOI Out",          color:"#a21caf" },
-    { id:"webinar-closed",  label:"Closed",           color:"#86198f" }
+    { id:"webinar-closed",  label:"Closed",           color:"#86198f" },
+    { id:"webinar-nurture", label:"Long Term Nurture", color:"#9f7aa8" }
   ];
   window.WEBINAR_STAGES = WEBINAR_STAGES;
 
@@ -29751,6 +29845,495 @@ if(params.get("u") && params.get("pin")){
       if(strip() || tries > 60) clearInterval(iv);
     }, 950);
   })();
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — DUPLICATE FINDER & MERGE
+     Scans every prospect for likely duplicates (same NMLS, email,
+     LinkedIn, phone, or the same person under a nickname) and
+     surfaces them for review. Merging is non-destructive: the
+     surviving record inherits every field the other had, all
+     notes / files / activity / stage history are carried over,
+     and the absorbed record is tombstoned so the sync can never
+     resurrect it.
+     ============================================================ -->
+<style>
+  .dup-group{border:1px solid var(--line);border-radius:14px;background:var(--surface);margin-bottom:14px;overflow:hidden}
+  .dup-head{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--surface-2);border-bottom:1px solid var(--line)}
+  .dup-why{font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:#a16207;
+    background:rgba(161,98,7,.1);border:1px solid rgba(161,98,7,.3);border-radius:999px;padding:2px 9px}
+  .dup-why.high{color:#b91c1c;background:rgba(185,28,28,.09);border-color:rgba(185,28,28,.3)}
+  .dup-acts{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap}
+  .dup-cards{display:grid;grid-template-columns:1fr 1fr;gap:0}
+  .dup-card{padding:12px 14px;border-right:1px solid var(--line);cursor:pointer}
+  .dup-card:last-child{border-right:0}
+  .dup-card:hover{background:var(--surface-2)}
+  .dup-card.keep{box-shadow:inset 3px 0 0 var(--brand)}
+  .dup-name{font-weight:700;font-size:14px;margin-bottom:2px}
+  .dup-role{font-size:12px;color:var(--t-3);margin-bottom:8px}
+  .dup-f{display:flex;gap:6px;font-size:11.5px;line-height:1.6}
+  .dup-f b{color:var(--t-3);font-weight:600;min-width:64px;flex:0 0 auto}
+  .dup-f span{color:var(--t-1);word-break:break-word}
+  .dup-badge{display:inline-block;font-size:10px;font-weight:700;color:var(--brand);background:var(--brand-soft,rgba(0,129,139,.1));
+    border-radius:999px;padding:1px 8px;margin-top:8px}
+  @media(max-width:640px){ .dup-cards{grid-template-columns:1fr} .dup-card{border-right:0;border-bottom:1px solid var(--line)} }
+</style>
+<script>
+(function(){
+  "use strict";
+
+  var NICK = {
+    mike:"michael", mikey:"michael", bob:"robert", bobby:"robert", rob:"robert", bill:"william", billy:"william",
+    will:"william", jim:"james", jimmy:"james", jamie:"james", joe:"joseph", joey:"joseph", dave:"david",
+    dan:"daniel", danny:"daniel", chris:"christopher", matt:"matthew", tom:"thomas", tommy:"thomas",
+    tony:"anthony", rick:"richard", ricky:"richard", dick:"richard", rich:"richard", steve:"steven",
+    stephen:"steven", ed:"edward", eddie:"edward", ted:"edward", nick:"nicholas", greg:"gregory",
+    jeff:"jeffrey", ken:"kenneth", kenny:"kenneth", larry:"lawrence", ron:"ronald", ronnie:"ronald",
+    don:"donald", donnie:"donald", andy:"andrew", drew:"andrew", charlie:"charles", chuck:"charles",
+    frank:"francis", gene:"eugene", hank:"henry", jack:"john", johnny:"john", jon:"jonathan",
+    ben:"benjamin", benny:"benjamin", sam:"samuel", alex:"alexander", pat:"patrick", tim:"timothy",
+    phil:"philip", art:"arthur", gus:"august", sal:"salvatore", vinny:"vincent", vince:"vincent",
+    liz:"elizabeth", beth:"elizabeth", betsy:"elizabeth", kate:"katherine", katie:"katherine",
+    kathy:"katherine", cathy:"catherine", sue:"susan", suzy:"susan", deb:"deborah", debbie:"deborah",
+    jen:"jennifer", jenny:"jennifer", jess:"jessica", becky:"rebecca", meg:"margaret", peggy:"margaret",
+    maggie:"margaret", trish:"patricia", patty:"patricia", val:"valerie", vicky:"victoria", nikki:"nicole",
+    mandy:"amanda", sandy:"sandra", barb:"barbara", carol:"caroline", chris_f:"christine"
+  };
+
+  function clean(v){ return String(v == null ? "" : v).toLowerCase().replace(/[^a-z0-9]/g, ""); }
+  function canonFirst(v){
+    var f = clean(v);
+    return NICK[f] || f;
+  }
+  function digits(v){ return String(v == null ? "" : v).replace(/\D/g, "").replace(/^1(?=\d{10}$)/, ""); }
+  function liSlug(v){
+    var m = String(v == null ? "" : v).match(/linkedin\.com\/(?:[a-z]{2}\/)?(?:in|pub)\/([^\/?#]+)/i);
+    return m ? m[1].toLowerCase() : "";
+  }
+  function pairKey(a, b){ return [a, b].sort().join("|"); }
+
+  // Why two records look like the same person. Returns null, or
+  // { level:"high"|"medium", why:"…" }.
+  function compare(a, b){
+    var an = clean(a.nmls), bn = clean(b.nmls);
+    if(an && an === bn) return { level:"high", why:"Same NMLS #" + a.nmls };
+
+    var ae = clean(a.email), be = clean(b.email);
+    if(ae && ae === be) return { level:"high", why:"Same email" };
+
+    var al = liSlug(a.linkedin), bl = liSlug(b.linkedin);
+    if(al && al === bl) return { level:"high", why:"Same LinkedIn profile" };
+
+    var afn = canonFirst(a.firstName), bfn = canonFirst(b.firstName);
+    var aln = clean(a.lastName), bln = clean(b.lastName);
+    var sameLast = aln && aln === bln;
+    var sameFirst = afn && afn === bfn;
+    var exactName = sameLast && clean(a.firstName) === clean(b.firstName) && clean(a.firstName);
+
+    if(exactName) return { level:"high", why:"Same name" };
+    if(sameFirst && sameLast) return { level:"high", why:"Same name (nickname match)" };
+
+    var ap = digits(a.phone), bp = digits(b.phone);
+    if(ap && ap.length >= 10 && ap === bp) return { level:"medium", why:"Same phone number" };
+
+    if(sameLast && afn && bfn){
+      // Only when the first names are plausibly the SAME name — one a
+      // truncation of the other (Kath/Katherine). Matching on first initial
+      // alone wrongly pairs colleagues like Sarah Klein and Steve Klein.
+      var shorter = afn.length <= bfn.length ? afn : bfn;
+      var longer  = afn.length <= bfn.length ? bfn : afn;
+      var prefixMatch = shorter.length >= 3 && longer.indexOf(shorter) === 0;
+      if(prefixMatch){
+        var ac = clean(a.company), bc = clean(b.company);
+        if(ac && ac === bc) return { level:"medium", why:"Same last name and company" };
+      }
+    }
+    return null;
+  }
+
+  function findDuplicates(){
+    var ps = (state.prospects || []).filter(Boolean);
+    var dismissed = {};
+    (state.dupeDismissed || []).forEach(function(k){ dismissed[k] = true; });
+    var pairs = [];
+    for(var i = 0; i < ps.length; i++){
+      for(var j = i + 1; j < ps.length; j++){
+        var a = ps[i], b = ps[j];
+        if(!a.id || !b.id) continue;
+        if(dismissed[pairKey(a.id, b.id)]) continue;
+        var r = compare(a, b);
+        if(r) pairs.push({ a:a, b:b, level:r.level, why:r.why });
+      }
+    }
+    pairs.sort(function(x, y){ return (x.level === "high" ? 0 : 1) - (y.level === "high" ? 0 : 1); });
+    return pairs;
+  }
+  window.findDuplicates = findDuplicates;
+
+  // How "complete" a record is — used to suggest which one to keep.
+  function score(p){
+    var n = 0;
+    ["firstName","lastName","company","market","nmls","position","phone","email","linkedin","notes"].forEach(function(k){
+      if(p[k] && String(p[k]).trim()) n++;
+    });
+    if(p.research && !p.research.error) n += 4;
+    n += Math.min(5, (p.noteLog || []).length);
+    n += Math.min(3, (p.files || []).length);
+    n += Math.min(3, (p.stagesSeen || []).length);
+    if(p.hireDate) n += 3;
+    if(p.loiOutDate) n += 2;
+    var STAGE_RANK = { "closed":9, "webinar-closed":9, "loi":8, "webinar-loi":8, "engaged":7, "webinar-engaged":7,
+                       "engaging":6, "awaiting-li-accept":5, "waiting-li-send":4, "waiting-first-text":3, "new":1 };
+    n += (STAGE_RANK[p.stage] || 0);
+    return n;
+  }
+
+  // Merge `loser` INTO `keeper`. Nothing is thrown away.
+  function mergeInto(keeper, loser){
+    // 1. Fill any blank field on the keeper from the loser.
+    Object.keys(loser).forEach(function(k){
+      if(k === "id" || k.charAt(0) === "_") return;
+      if(["noteLog","files","stagesSeen","textDrafts","cadence","research"].indexOf(k) !== -1) return;
+      var kv = keeper[k], lv = loser[k];
+      var kEmpty = (kv === undefined || kv === null || kv === "" ||
+                    (Array.isArray(kv) && !kv.length));
+      if(kEmpty && lv !== undefined && lv !== null && lv !== "") keeper[k] = lv;
+    });
+    // 2. Research: keep whichever real dossier exists (prefer the keeper's).
+    if((!keeper.research || keeper.research.error) && loser.research && !loser.research.error){
+      keeper.research = loser.research;
+      delete keeper.dataExpired;
+    }
+    // 3. Union the collections.
+    function unionBy(field, key){
+      var out = (keeper[field] || []).slice();
+      (loser[field] || []).forEach(function(item){
+        if(!item) return;
+        var id = key ? item[key] : item;
+        if(!out.some(function(x){ return x && (key ? x[key] === id : x === id); })) out.push(item);
+      });
+      keeper[field] = out;
+    }
+    unionBy("noteLog", "id");
+    unionBy("files", "url");
+    unionBy("textDrafts", "at");
+    (loser.stagesSeen || []).forEach(function(st){
+      if(!Array.isArray(keeper.stagesSeen)) keeper.stagesSeen = [];
+      if(keeper.stagesSeen.indexOf(st) === -1) keeper.stagesSeen.push(st);
+    });
+    // 4. Report dates — keep the earliest real one.
+    ["hireDate","loiOutDate","createdAt"].forEach(function(k){
+      if(loser[k] && (!keeper[k] || loser[k] < keeper[k])) keeper[k] = loser[k];
+    });
+    // 5. Cadence: keep whichever is actually running.
+    if((!keeper.cadence || !keeper.cadence.startedAt) && loser.cadence && loser.cadence.startedAt){
+      keeper.cadence = loser.cadence;
+    }
+    // 6. Move the loser's activity onto the keeper BEFORE tombstoning, so the
+    //    history survives and isn't dropped as an orphan.
+    (state.activities || []).forEach(function(act){
+      if(act && act.prospectId === loser.id) act.prospectId = keeper.id;
+    });
+    // 7. Remove the loser and tombstone it so no device resurrects it.
+    state.prospects = (state.prospects || []).filter(function(x){ return x && x.id !== loser.id; });
+    state.deletedIds = state.deletedIds || [];
+    if(state.deletedIds.indexOf(loser.id) === -1) state.deletedIds.push(loser.id);
+    if(state.deletedIds.length > 500) state.deletedIds = state.deletedIds.slice(-500);
+    keeper._rev = Date.now();
+
+    if(typeof logActivity === "function"){
+      logActivity(keeper.id, "note", "Merged duplicate record (" + ((loser.firstName||"") + " " + (loser.lastName||"")).trim() + ") into this prospect");
+    }
+    window._allowShrinkPush = true;
+    persist();
+    setTimeout(function(){ window._allowShrinkPush = false; }, 8000);
+  }
+  window.mergeProspects = mergeInto;
+
+  function fieldRow(label, val){
+    return e("div",{class:"dup-f"}, e("b",{}, label), e("span",{}, val || "\u2014"));
+  }
+
+  function card(p, isKeep, onPick){
+    var c = e("div",{class:"dup-card" + (isKeep ? " keep" : ""), onClick:onPick});
+    c.appendChild(e("div",{class:"dup-name"}, ((p.firstName||"") + " " + (p.lastName||"")).trim() || "Unnamed"));
+    c.appendChild(e("div",{class:"dup-role"}, [p.company, p.position].filter(Boolean).join(" \u00B7 ") || "\u2014"));
+    c.appendChild(fieldRow("Stage", (typeof getStageLabel === "function") ? getStageLabel(p.stage) : p.stage));
+    c.appendChild(fieldRow("NMLS", p.nmls));
+    c.appendChild(fieldRow("Phone", p.phone));
+    c.appendChild(fieldRow("Email", p.email));
+    c.appendChild(fieldRow("Added", p.createdAt ? new Date(p.createdAt).toLocaleDateString("en-US",{month:"short",day:"numeric",year:"numeric"}) : "\u2014"));
+    var extras = [];
+    if(p.research && !p.research.error) extras.push("research");
+    if((p.noteLog||[]).length) extras.push((p.noteLog||[]).length + " notes");
+    if((p.files||[]).length) extras.push((p.files||[]).length + " files");
+    if(p.hireDate) extras.push("hire date");
+    if(extras.length) c.appendChild(e("div",{class:"dup-badge"}, extras.join(" \u00B7 ")));
+    if(isKeep) c.appendChild(e("div",{class:"dup-badge"}, "\u2713 KEEPING THIS ONE"));
+    return c;
+  }
+
+  window.viewDuplicates = function(){
+    var wrap = e("div",{class:"screen"});
+    var pairs = findDuplicates();
+    wrap.appendChild(e("div",{class:"h-section"},
+      e("div",{},
+        e("h2",{},"Possible duplicates"),
+        e("div",{class:"sub"}, pairs.length ? (pairs.length + " pair" + (pairs.length===1?"":"s") + " to review") : "Nothing to review")
+      ),
+      e("div",{class:"actions"}, e("button",{class:"pipe-btn",onClick:function(){ navigate("prospects"); }},"\u2190 Pipeline"))
+    ));
+    if(!pairs.length){
+      wrap.appendChild(e("div",{class:"empty"}, e("div",{class:"ic"},"\u2713"), "No duplicates found."));
+      return wrap;
+    }
+    wrap.appendChild(e("p",{class:"muted",style:"font-size:12.5px;line-height:1.55;margin:0 0 14px"},
+      "Click a card to choose which record to keep. Merging moves everything \u2014 notes, files, activity, research, stage history \u2014 onto the one you keep, then removes the other for good."));
+
+    pairs.forEach(function(pr){
+      var keepA = score(pr.a) >= score(pr.b);
+      var grp = e("div",{class:"dup-group"});
+      function draw(){
+        grp.innerHTML = "";
+        var head = e("div",{class:"dup-head"},
+          e("span",{class:"dup-why" + (pr.level === "high" ? " high" : "")}, pr.why)
+        );
+        var acts = e("div",{class:"dup-acts"});
+        acts.appendChild(e("button",{class:"pipe-btn",onClick:function(){
+          state.dupeDismissed = state.dupeDismissed || [];
+          state.dupeDismissed.push(pairKey(pr.a.id, pr.b.id));
+          persist();
+          showToast("Marked as different people");
+          navigate(state.screen, { replace:true });
+        }}, "Not duplicates"));
+        acts.appendChild(e("button",{class:"pipe-btn",style:"background:var(--brand);border-color:var(--brand);color:#fff",onClick:function(){
+          var keeper = keepA ? pr.a : pr.b, loser = keepA ? pr.b : pr.a;
+          uiConfirm("Merge \u201C" + ((loser.firstName||"")+" "+(loser.lastName||"")).trim() + "\u201D into \u201C" +
+                    ((keeper.firstName||"")+" "+(keeper.lastName||"")).trim() + "\u201D? Everything moves onto the record you're keeping. This can't be undone.",
+            function(){
+              mergeInto(keeper, loser);
+              showToast("Merged \u2014 one record now");
+              navigate(state.screen, { replace:true });
+            }, { title:"Merge duplicates", okLabel:"Merge them" });
+        }}, "Merge"));
+        head.appendChild(acts);
+        grp.appendChild(head);
+        var cards = e("div",{class:"dup-cards"});
+        cards.appendChild(card(pr.a, keepA, function(){ keepA = true; draw(); }));
+        cards.appendChild(card(pr.b, !keepA, function(){ keepA = false; draw(); }));
+        grp.appendChild(cards);
+      }
+      draw();
+      wrap.appendChild(grp);
+    });
+    return wrap;
+  };
+
+  // Route + Settings entry point.
+  if(typeof window.render === "function"){
+    var _r = window.render;
+    window.render = function(){
+      if(state.screen === "dupes"){
+        var main = document.querySelector("#main");
+        var r = _r.apply(this, arguments);
+        try{
+          if(main){
+            main.innerHTML = "";
+            main.appendChild(window.viewDuplicates());
+            var t = document.querySelector("#tb-title");
+            if(t) t.textContent = "Possible duplicates";
+          }
+        }catch(err){ console.error("dupes route", err); }
+        return r;
+      }
+      return _r.apply(this, arguments);
+    };
+  }
+
+  if(typeof window.viewSettings === "function"){
+    var _vs = window.viewSettings;
+    window.viewSettings = function(){
+      var w = _vs.apply(this, arguments);
+      try{
+        var n = findDuplicates().length;
+        var card2 = e("div",{class:"card",style:"margin-top:12px"});
+        card2.appendChild(e("h3",{style:"margin:0 0 8px;font-size:14px"}, "Duplicate prospects"));
+        card2.appendChild(e("p",{class:"muted",style:"font-size:12.5px;margin:0 0 10px;line-height:1.55"},
+          n ? (n + " possible duplicate pair" + (n===1?"":"s") + " found \u2014 same NMLS, email, LinkedIn, phone, or the same person under a nickname.")
+            : "No duplicates found right now."));
+        card2.appendChild(e("button",{class:"btn sm" + (n ? "" : " subtle"),onClick:function(){ navigate("dupes"); }},
+          n ? ("Review " + n + " duplicate" + (n===1?"":"s")) : "Scan again"));
+        w.appendChild(card2);
+      }catch(err){ console.error("dupe settings card", err); }
+      return w;
+    };
+  }
+})();
+</script>
+
+<!-- ============================================================
+     RECRUIT OS — POLISH & MOTION LAYER
+     One coherent motion system: fast, subtle, professional.
+     · Screens rise-fade in ONLY on real navigation (sync
+       re-renders stay perfectly still — nothing jumps while
+       you're reading).
+     · Lists stagger in gently (rows, funnel bands, cards).
+     · Every control shares the same press/hover feel.
+     · Modals scale in, the toast springs up.
+     · All of it honors prefers-reduced-motion.
+     ============================================================ -->
+<style>
+  :root{
+    --m-fast: 150ms;
+    --m-med: 240ms;
+    --m-slow: 340ms;
+    --m-ease: cubic-bezier(.22,.9,.28,1);      /* confident ease-out */
+    --m-spring: cubic-bezier(.34,1.4,.44,1);   /* tiny overshoot for pop-ins */
+    --m-lift: 0 6px 16px rgba(10,30,34,.09);
+  }
+
+  /* ---------- shared control feel ---------- */
+  .btn, .pipe-btn, .pipe-seg button, .fn-open, .wl-move, .note-del, .dup-acts button,
+  .pd-tab, .wwon-cat, .fn-chip, .intel-row, .k-card, .wl-row{
+    transition: transform var(--m-fast) var(--m-ease),
+                box-shadow var(--m-fast) var(--m-ease),
+                background var(--m-fast) var(--m-ease),
+                border-color var(--m-fast) var(--m-ease),
+                color var(--m-fast) var(--m-ease),
+                opacity var(--m-fast) var(--m-ease);
+  }
+  .btn:hover, .pipe-btn:hover, .fn-open:hover{ transform: translateY(-1px); box-shadow: var(--m-lift); }
+  .btn:active, .pipe-btn:active, .pipe-seg button:active, .fn-open:active,
+  .fn-chip:active, .wwon-cat:active, .dup-acts button:active{ transform: translateY(0) scale(.985); box-shadow: none; }
+
+  /* ---------- cards & rows ---------- */
+  .card, .fn-band, .dup-group, .gate-card, .tg-card{
+    transition: box-shadow var(--m-med) var(--m-ease), border-color var(--m-fast) var(--m-ease), transform var(--m-med) var(--m-ease);
+  }
+  .fn-band:hover, .dup-group:hover{ box-shadow: var(--m-lift); }
+  .k-card:hover{ transform: translateY(-2px); box-shadow: var(--m-lift); }
+  .k-card:active{ transform: scale(.99); cursor: grabbing; }
+  .wl-row:hover{ transform: translateX(2px); }
+  .intel-row{ border-left: 2px solid transparent; }
+  .intel-row:hover{ border-left-color: var(--brand); padding-left: 4px; }
+
+  /* ---------- tabs: sliding accent ---------- */
+  .pd-tab{ position: relative; }
+  .pd-tab::after{
+    content:""; position:absolute; left:12px; right:12px; bottom:-1px; height:2px;
+    background: var(--brand); border-radius:2px;
+    transform: scaleX(0); transform-origin:center;
+    transition: transform var(--m-med) var(--m-ease);
+  }
+  .pd-tab.active::after{ transform: scaleX(1); }
+  .pd-tab:hover:not(.active)::after{ transform: scaleX(.4); opacity:.45; }
+
+  /* ---------- inputs ---------- */
+  input, select, textarea{
+    transition: border-color var(--m-fast) var(--m-ease), box-shadow var(--m-fast) var(--m-ease), background var(--m-fast) var(--m-ease);
+  }
+  input:focus, select:focus, textarea:focus{
+    border-color: var(--brand);
+    box-shadow: 0 0 0 3px var(--brand-soft, rgba(0,129,139,.13));
+  }
+
+  /* ---------- modal: fade backdrop, scale panel ---------- */
+  @keyframes m-backdrop{ from{ opacity:0 } to{ opacity:1 } }
+  @keyframes m-panel{ from{ opacity:0; transform: translateY(14px) scale(.975) } to{ opacity:1; transform:none } }
+  .modal-bg.show{ animation: m-backdrop var(--m-med) var(--m-ease) both; }
+  .modal-bg.show .modal{ animation: m-panel var(--m-slow) var(--m-spring) both; }
+
+  /* ---------- toast: springs up ---------- */
+  @keyframes m-toast{ from{ opacity:0; transform: translate(-50%, 14px) scale(.96) } to{ opacity:1; transform: translate(-50%, 0) scale(1) } }
+  .toast.show{ animation: m-toast var(--m-slow) var(--m-spring) both; }
+
+  /* ---------- route transitions (real navigation only) ---------- */
+  @keyframes m-rise{ from{ opacity:0; transform: translateY(10px) } to{ opacity:1; transform:none } }
+  #main.route-anim > *{ animation: m-rise var(--m-slow) var(--m-ease) both; }
+
+  /* staggered list entrances, capped so long lists don't crawl */
+  #main.route-anim .intel-panel > .intel-row,
+  #main.route-anim .fn-band,
+  #main.route-anim .sf-grid > .k-card,
+  #main.route-anim .wl-row,
+  #main.route-anim .dup-group,
+  #main.route-anim .wwon-cat,
+  #main.route-anim .note-entry,
+  #main.route-anim .tg-var{
+    animation: m-rise var(--m-med) var(--m-ease) both;
+  }
+  #main.route-anim .intel-panel > .intel-row:nth-child(1), #main.route-anim .fn-band:nth-child(1),
+  #main.route-anim .sf-grid > .k-card:nth-child(1), #main.route-anim .wl-row:nth-child(1),
+  #main.route-anim .dup-group:nth-child(1), #main.route-anim .note-entry:nth-child(1){ animation-delay: 30ms; }
+  #main.route-anim .intel-panel > .intel-row:nth-child(2), #main.route-anim .fn-band:nth-child(2),
+  #main.route-anim .sf-grid > .k-card:nth-child(2), #main.route-anim .wl-row:nth-child(2),
+  #main.route-anim .dup-group:nth-child(2), #main.route-anim .note-entry:nth-child(2){ animation-delay: 65ms; }
+  #main.route-anim .intel-panel > .intel-row:nth-child(3), #main.route-anim .fn-band:nth-child(3),
+  #main.route-anim .sf-grid > .k-card:nth-child(3), #main.route-anim .wl-row:nth-child(3),
+  #main.route-anim .dup-group:nth-child(3), #main.route-anim .note-entry:nth-child(3){ animation-delay: 100ms; }
+  #main.route-anim .intel-panel > .intel-row:nth-child(4), #main.route-anim .fn-band:nth-child(4),
+  #main.route-anim .sf-grid > .k-card:nth-child(4), #main.route-anim .wl-row:nth-child(4){ animation-delay: 135ms; }
+  #main.route-anim .intel-panel > .intel-row:nth-child(5), #main.route-anim .fn-band:nth-child(5),
+  #main.route-anim .sf-grid > .k-card:nth-child(5), #main.route-anim .wl-row:nth-child(5){ animation-delay: 170ms; }
+  #main.route-anim .intel-panel > .intel-row:nth-child(6), #main.route-anim .fn-band:nth-child(6),
+  #main.route-anim .sf-grid > .k-card:nth-child(6), #main.route-anim .wl-row:nth-child(6){ animation-delay: 205ms; }
+  #main.route-anim .intel-panel > .intel-row:nth-child(n+7), #main.route-anim .fn-band:nth-child(n+7),
+  #main.route-anim .sf-grid > .k-card:nth-child(n+7), #main.route-anim .wl-row:nth-child(n+7){ animation-delay: 235ms; }
+
+  /* gate card gets a confident pop on arrival */
+  #main.route-anim .gate-card{ animation: m-panel var(--m-slow) var(--m-spring) both; }
+
+  /* funnel count + volume settle in slightly after the band */
+  #main.route-anim .fn-count, #main.route-anim .fn-vol{ animation: m-rise var(--m-med) var(--m-ease) both; animation-delay: 120ms; }
+
+  /* webinar badge shimmer-free, just a soft fade */
+  #main.route-anim .wl-badge, #main.route-anim .pd-wl-pill{ animation: m-rise var(--m-med) var(--m-ease) both; animation-delay: 150ms; }
+
+  /* ---------- accessibility: motion off means OFF ---------- */
+  @media (prefers-reduced-motion: reduce){
+    .btn, .pipe-btn, .pipe-seg button, .fn-open, .wl-move, .note-del, .dup-acts button,
+    .pd-tab, .wwon-cat, .fn-chip, .intel-row, .k-card, .wl-row,
+    .card, .fn-band, .dup-group, .gate-card, .tg-card,
+    input, select, textarea{ transition: none !important; }
+    .modal-bg.show, .modal-bg.show .modal, .toast.show,
+    #main.route-anim > *, #main.route-anim .intel-panel > .intel-row,
+    #main.route-anim .fn-band, #main.route-anim .sf-grid > .k-card,
+    #main.route-anim .wl-row, #main.route-anim .dup-group,
+    #main.route-anim .wwon-cat, #main.route-anim .note-entry,
+    #main.route-anim .tg-var, #main.route-anim .gate-card,
+    #main.route-anim .fn-count, #main.route-anim .fn-vol,
+    #main.route-anim .wl-badge, #main.route-anim .pd-wl-pill{ animation: none !important; }
+    .k-card:hover, .wl-row:hover, .btn:hover, .pipe-btn:hover, .fn-open:hover{ transform: none !important; }
+  }
+</style>
+<script>
+(function(){
+  "use strict";
+  // Route-aware entrance: animate #main's content ONLY when the screen
+  // actually changes. In-place refreshes and quiet sync re-renders keep the
+  // page perfectly still — motion never interrupts reading or typing.
+  if(typeof window.render !== "function") return;
+  var _r = window.render;
+  var last = null, clearT = null;
+  window.render = function(){
+    var changed = state && state.screen !== last;
+    var out = _r.apply(this, arguments);
+    try{
+      var main = document.querySelector("#main");
+      if(main){
+        if(changed){
+          main.classList.remove("route-anim");
+          void main.offsetWidth;               // restart the animation cleanly
+          main.classList.add("route-anim");
+          clearTimeout(clearT);
+          clearT = setTimeout(function(){ main.classList.remove("route-anim"); }, 700);
+        }
+      }
+      last = state ? state.screen : null;
+    }catch(e){}
+    return out;
+  };
 })();
 </script>
 </body>
