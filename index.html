@@ -28316,6 +28316,8 @@ if(params.get("u") && params.get("pin")){
     return _jsPdfPromise;
   }
 
+  window.__loadJsPdf = loadJsPdf;
+
   function openHtmlFallback(html){
     var w = window.open("", "_blank");
     if(!w){ if(typeof showToast === "function") showToast("Pop-up blocked \u2014 allow pop-ups to open the report"); return; }
@@ -28413,7 +28415,7 @@ if(params.get("u") && params.get("pin")){
 <script>
 (function(){
   "use strict";
-  window.__ROS_BUILD = "Build 2026-07-30AD \u2014 motion & polish layer";
+  window.__ROS_BUILD = "Build 2026-07-31AE \u2014 webinar list view + PDF export";
   try { console.log("[RecruitOS] " + window.__ROS_BUILD); } catch(e){}
   if(typeof window.viewSettings === "function"){
     var _vs = window.viewSettings;
@@ -29321,6 +29323,10 @@ if(params.get("u") && params.get("pin")){
     font-size:12px;font-family:inherit;color:var(--t-2);cursor:pointer;max-width:190px}
   .wl-move:hover{border-color:#d946ef;color:#a21caf}
   .wl-move:focus{outline:none;border-color:#d946ef}
+  .wl-listbar{display:flex;align-items:center;gap:14px;padding:10px 13px;border:1px solid var(--line);
+    border-radius:12px;background:var(--surface-2);margin-bottom:10px;flex-wrap:wrap}
+  .wl-selall{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:600;color:var(--t-2);cursor:pointer}
+  .wl-check{width:17px;height:17px;flex:0 0 auto;accent-color:#d946ef;cursor:pointer}
   /* timestamped note entries */
   .note-entry{padding:10px 0;border-bottom:1px solid var(--line)}
   .note-entry:last-child{border-bottom:0;padding-bottom:0}
@@ -29452,13 +29458,67 @@ if(params.get("u") && params.get("pin")){
     if(typeof navigate === "function") navigate(state.screen, { replace:true });
   }
 
+  // Export the selected leads to a branded PDF: Name / Company / State / NMLS / Phone.
+  function exportWebinarPdf(list){
+    if(!list.length){ showToast("Select at least one lead first"); return; }
+    if(typeof window.__loadJsPdf !== "function"){ showToast("PDF engine unavailable"); return; }
+    showToast("Building PDF\u2026");
+    window.__loadJsPdf().then(function(jsPDF){
+      var TEAL=[0,129,139], GOLD=[255,172,39], INK=[15,20,22], MUTED=[91,102,112];
+      var doc = new jsPDF({ unit:"pt", format:"letter" });
+      var W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight(), M = 40;
+      doc.setFillColor(TEAL[0],TEAL[1],TEAL[2]); doc.rect(0,0,W,6,"F");
+      doc.setFont("helvetica","bold"); doc.setFontSize(8); doc.setTextColor(TEAL[0],TEAL[1],TEAL[2]);
+      doc.text("PARTNERS MORTGAGE  \u00B7  NATIONAL BUSINESS DEVELOPMENT", M, 34);
+      doc.setFontSize(19); doc.setTextColor(INK[0],INK[1],INK[2]);
+      doc.text("Webinar Leads", M, 58);
+      doc.setFont("helvetica","normal"); doc.setFontSize(9.5); doc.setTextColor(MUTED[0],MUTED[1],MUTED[2]);
+      doc.text(new Date().toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"})
+        + "   \u00B7   " + list.length + " selected contact" + (list.length===1?"":"s")
+        + "   \u00B7   Prepared by " + ((state.user && state.user.name) || "Recruiting Team"), M, 74);
+      doc.setFillColor(GOLD[0],GOLD[1],GOLD[2]); doc.rect(M, 84, 58, 3, "F");
+      var rows = list.map(function(p){
+        return [
+          ((p.firstName||"") + " " + (p.lastName||"")).trim() || "\u2014",
+          p.company || "\u2014",
+          p.state || p.market || "\u2014",
+          p.nmls ? String(p.nmls) : "\u2014",
+          p.phone || "\u2014"
+        ];
+      });
+      doc.autoTable({
+        startY: 100, margin:{ left:M, right:M, bottom:44 },
+        head:[["Name","Company","State","NMLS","Phone"]],
+        body:rows,
+        styles:{ fontSize:9, cellPadding:{ top:6, bottom:6, left:6, right:6 }, textColor:INK, overflow:"linebreak", valign:"top" },
+        headStyles:{ fillColor:TEAL, textColor:[255,255,255], fontSize:7.5, fontStyle:"bold" },
+        alternateRowStyles:{ fillColor:[247,250,250] },
+        columnStyles:{ 0:{ cellWidth:140, fontStyle:"bold" }, 1:{ cellWidth:130 }, 2:{ cellWidth:92 }, 3:{ cellWidth:64 }, 4:{ cellWidth:"auto" } },
+        didDrawPage:function(){
+          var pg = doc.internal.getNumberOfPages();
+          doc.setFont("helvetica","normal"); doc.setFontSize(7.5); doc.setTextColor(MUTED[0],MUTED[1],MUTED[2]);
+          doc.text("Partners Mortgage \u2014 internal & confidential", M, H - 22);
+          doc.text("Generated from RecruitOS  \u00B7  Page " + pg, W - M, H - 22, { align:"right" });
+        }
+      });
+      doc.save("Webinar-Leads-" + new Date().toISOString().slice(0,10) + ".pdf");
+      showToast("PDF downloaded");
+    }).catch(function(err){
+      console.error("webinar pdf", err);
+      showToast("Couldn't build the PDF \u2014 check connection");
+    });
+  }
+
   window.viewWebinarLeads = function(){
     ensureWebinarStages();
     var wrap = e("div",{class:"screen"});
     var all = webinarLeads();
     var q = "";
+    var mode = (function(){ try{ return localStorage.getItem("pm_webinar_view") || "stages"; }catch(err){ return "stages"; } })();
+    window._wlSel = window._wlSel || {};
     var bands = e("div",{});
     var search = e("input",{type:"search", class:"pipe-search", placeholder:"Search webinar leads\u2026"});
+    function setMode(m){ try{ localStorage.setItem("pm_webinar_view", m); }catch(err){} navigate(state.screen,{replace:true}); }
 
     wrap.appendChild(e("div",{class:"h-section"},
       e("div",{},
@@ -29468,6 +29528,10 @@ if(params.get("u") && params.get("pin")){
       e("div",{class:"actions"},
         e("div",{class:"pipe-toolbar"},
           search,
+          e("div",{class:"pipe-seg"},
+            e("button",{class:(mode==="stages"?"on":""),onClick:function(){ setMode("stages"); }},"Stages"),
+            e("button",{class:(mode==="list"?"on":""),onClick:function(){ setMode("list"); }},"List")
+          ),
           e("button",{class:"pipe-btn wl",onClick:function(){ window.addWebinarLead(); }}, "+ Add lead"),
           e("button",{class:"pipe-btn",onClick:function(){ navigate("prospects"); }}, "\u2190 Main pipeline")
         )
@@ -29510,7 +29574,46 @@ if(params.get("u") && params.get("pin")){
       return r;
     }
 
+    function drawList(){
+      bands.innerHTML = "";
+      var ppl = all.filter(matches).sort(function(a,b){
+        return ((a.lastName||"") + (a.firstName||"")).localeCompare((b.lastName||"") + (b.firstName||""));
+      });
+      var selCount = ppl.filter(function(p){ return window._wlSel[p.id]; }).length;
+      var bar = e("div",{class:"wl-listbar"});
+      var allBox = e("input",{type:"checkbox"});
+      allBox.checked = ppl.length > 0 && selCount === ppl.length;
+      allBox.addEventListener("change", function(){
+        ppl.forEach(function(p){ window._wlSel[p.id] = allBox.checked; });
+        navigate(state.screen,{replace:true});
+      });
+      bar.appendChild(e("label",{class:"wl-selall"}, allBox, e("span",{}, "Select all" + (q ? " (filtered)" : ""))));
+      bar.appendChild(e("span",{class:"muted",style:"font-size:12px"}, selCount + " selected"));
+      bar.appendChild(e("button",{class:"pipe-btn wl",style:"margin-left:auto",onClick:function(){
+        exportWebinarPdf(ppl.filter(function(p){ return window._wlSel[p.id]; }));
+      }}, "\u2913 Export PDF (" + selCount + ")"));
+      bands.appendChild(bar);
+      if(!ppl.length){
+        bands.appendChild(e("div",{class:"empty"}, e("div",{class:"ic"},"\u00B7"), q ? ("Nobody matches \u201C" + q + "\u201D.") : "No webinar leads yet."));
+        return;
+      }
+      ppl.forEach(function(p){
+        var r = e("div",{class:"wl-row"});
+        var cb = e("input",{type:"checkbox",class:"wl-check"});
+        cb.checked = !!window._wlSel[p.id];
+        cb.addEventListener("change", function(){ window._wlSel[p.id] = cb.checked; navigate(state.screen,{replace:true}); });
+        r.appendChild(cb);
+        r.appendChild(e("div",{class:"wl-main",style:"cursor:pointer",onClick:function(){ navigate("prospect:"+p.id); }},
+          e("div",{class:"wl-name"}, (p.firstName||"") + " " + (p.lastName||"")),
+          e("div",{class:"wl-sub"}, [p.company, (p.state || p.market), p.nmls ? ("NMLS " + p.nmls) : null, p.phone].filter(Boolean).join(" \u00B7 ") || "\u2014")
+        ));
+        r.appendChild(e("span",{class:"wl-tag"}, getStageLabel(p.stage)));
+        bands.appendChild(r);
+      });
+    }
+
     function draw(){
+      if(mode === "list"){ drawList(); return; }
       bands.innerHTML = "";
       var hits = 0;
       WEBINAR_STAGES.forEach(function(ws){
